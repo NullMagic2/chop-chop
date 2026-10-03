@@ -41,9 +41,7 @@ use the same cutting engine and translations.
 - **Per-job progress** with an ETA, Cancel (temporary files are cleaned up), overwrite confirmation, an editable file name filled in from the clip range, drag & drop, and Ctrl+O.
 - **Four languages**: English, Português, Español and Ελληνικά. Switch with the flag button; the choice is remembered, and on first launch the system language is used.
 
-### Batch split
 
-![Batch split into 4 equal parts, encoding in parallel](docs/screenshots/linux-batch-split.png)
 
 ## Windows
 
