@@ -10,6 +10,10 @@ on:
       tag:
         description: "Release tag to create, e.g. v1.8.0"
         required: true
+      draft:
+        description: "Draft for testing (only visible to the repository's maintainers)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -85,6 +89,8 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           name: Chop Chop Splitter ${{ github.event.inputs.tag || github.ref_name }}
           target_commitish: ${{ github.sha }}
+          draft: ${{ inputs.draft || false }}
+          prerelease: ${{ inputs.draft || false }}
           files: dist/*
           generate_release_notes: true
           body: |
