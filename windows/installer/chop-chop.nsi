@@ -1,7 +1,7 @@
 ; Chop Chop Splitter — Windows installer (NSIS 3, Modern UI 2).
 ;
 ; Build (from the repository root, after `cargo build --release` in windows/):
-;   makensis -DVERSION=1.7.3 -DAPPDIR=windows\target\release -DFFMPEG=path\to\ffmpeg\bin windows\installer\chop-chop.nsi
+;   makensis -DVERSION=1.7.4 -DAPPDIR=windows\target\release -DFFMPEG=path\to\ffmpeg\bin windows\installer\chop-chop.nsi
 ; APPDIR holds chop-chop.exe; FFMPEG holds ffmpeg.exe, ffprobe.exe and their DLLs.
 
 Unicode true
@@ -9,7 +9,7 @@ SetCompressor /SOLID lzma
 ManifestDPIAware true
 
 !ifndef VERSION
-  !define VERSION "1.7.3"
+  !define VERSION "1.7.4"
 !endif
 !ifndef APPDIR
   !define APPDIR "..\target\x86_64-pc-windows-gnu\release"

@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "chop-chop"
-version = "1.7.3"
+version = "1.7.4"
 dependencies = [
  "glib-build-tools",
  "gtk",
