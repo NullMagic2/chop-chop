@@ -1,11 +1,15 @@
 name: Release
 
-# Push a tag like v1.7.3 to build the Ubuntu .deb and the Windows installer
-# and publish them as a GitHub release.
+# Push a tag like v1.7.3 — or run this workflow by hand with that tag name — to build
+# the Ubuntu .deb and the Windows installer and publish them as a GitHub release.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create, e.g. v1.7.3"
+        required: true
 
 permissions:
   contents: write
@@ -78,6 +82,9 @@ jobs:
         run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: Chop Chop Splitter ${{ github.event.inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: dist/*
           generate_release_notes: true
           body: |

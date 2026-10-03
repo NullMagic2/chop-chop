@@ -120,9 +120,9 @@ You can also cross-compile from Linux with `rustup target add x86_64-pc-windows-
 
 ### Releases
 
-Pushing a tag such as `v1.7.3` runs the [Release workflow](.github/workflows/release.yml).
-It builds the `.deb` on Ubuntu 24.04 and the Windows installer, and publishes both to a
-GitHub release.
+Pushing a tag such as `v1.7.3`, or running the [Release workflow](.github/workflows/release.yml)
+by hand with that tag name, builds the `.deb` on Ubuntu 24.04 and the Windows installer and
+publishes both to a GitHub release.
 
 ## Project layout
 
