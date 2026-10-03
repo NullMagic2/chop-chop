@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Name=Chop Chop Splitter
+GenericName=Video Cutter
+GenericName[pt]=Cortador de vídeo
+GenericName[es]=Cortador de vídeo
+GenericName[el]=Αποκοπή βίντεο
+Comment=Cut clips from videos fast, using every CPU core
+Comment[pt]=Corte trechos de vídeos rapidamente, usando todos os núcleos
+Comment[es]=Corta fragmentos de vídeos rápidamente, usando todos los núcleos
+Comment[el]=Γρήγορη αποκοπή αποσπασμάτων βίντεο με όλους τους πυρήνες
+Exec=chop-chop %f
+Icon=io.github.ChopChop
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;GTK;
+Keywords=video;cut;trim;clip;split;audio;extract;ffmpeg;
+MimeType=video/mp4;video/x-matroska;video/quicktime;video/webm;video/x-msvideo;video/mpeg;video/ogg;video/x-flv;video/3gpp;
+StartupNotify=true
+StartupWMClass=chop-chop

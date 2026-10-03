@@ -1,0 +1,89 @@
+name: Release
+
+# Push a tag like v1.7.3 to build the Ubuntu .deb and the Windows installer
+# and publish them as a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    name: Ubuntu .deb
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev dpkg-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release
+      - run: ./packaging/build-deb.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: target/deb/*.deb
+
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build chop-chop.exe
+        working-directory: windows
+        run: cargo build --release
+      - name: Download FFmpeg (GPL, shared build)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg
+          $bin = (Get-ChildItem ffmpeg -Directory | Select-Object -First 1).FullName + "\bin"
+          "FFMPEG_BIN=$bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            if (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe") {
+              "${env:ProgramFiles(x86)}\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append
+            } else {
+              choco install nsis -y --no-progress
+              "${env:ProgramFiles(x86)}\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append
+            }
+          }
+      - name: Build installer
+        shell: pwsh
+        working-directory: windows/installer
+        run: |
+          $version = (Select-String -Path ..\Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          makensis -V3 "-DVERSION=$version" "-DAPPDIR=..\target\release" "-DFFMPEG=$env:FFMPEG_BIN" "-DOUTDIR=." chop-chop.nsi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: windows/installer/*-setup.exe
+
+  release:
+    name: Publish release
+    needs: [deb, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## Downloads
+
+            | Platform | File |
+            | --- | --- |
+            | **Ubuntu 24.04 / 26.04** (amd64) | `chop-chop_*_amd64.deb` — install with `sudo apt install ./chop-chop_*_amd64.deb` (pulls in FFmpeg) |
+            | **Windows 10 / 11** (x64) | `chop-chop-*-windows-x64-setup.exe` — FFmpeg is included |

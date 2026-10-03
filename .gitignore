@@ -1,0 +1,4 @@
+target/
+windows/target/
+*.deb
+*-setup.exe

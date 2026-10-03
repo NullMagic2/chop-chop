@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/io/github/chopchop">
+    <file>style.css</file>
+    <file>icons/scalable/actions/vs-flag-en.svg</file>
+    <file>icons/scalable/actions/vs-flag-pt.svg</file>
+    <file>icons/scalable/actions/vs-flag-es.svg</file>
+    <file>icons/scalable/actions/vs-flag-el.svg</file>
+    <file>icons/scalable/apps/io.github.ChopChop.svg</file>
+    <file>icons/256x256/apps/vs-folder-hero.png</file>
+    <file>icons/256x256/apps/vs-video-hero.png</file>
+    <file>icons/scalable/actions/vs-audio-x-generic-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-emblem-music-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-camera-video-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-computer-chip-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-dialog-error-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-dialog-warning-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-document-open-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-edit-clear-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-edit-cut-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-emblem-ok-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-emblem-videos-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-folder-open-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-folder-videos-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-media-playback-start-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-preferences-system-time-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-process-stop-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-timer-short-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-video-x-generic-symbolic.svg</file>
+    <file>icons/scalable/actions/vs-view-grid-symbolic.svg</file>
+  </gresource>
+</gresources>

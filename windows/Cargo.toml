@@ -1,0 +1,37 @@
+[package]
+name = "chop-chop-windows"
+version = "1.7.3"
+edition = "2021"
+description = "Chop Chop Splitter for Windows: native Win32 common-controls front end (windows-rs) sharing the FFmpeg engine with the GTK build"
+license = "MIT"
+build = "build.rs"
+
+[[bin]]
+name = "chop-chop"
+path = "src/main.rs"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_Globalization",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

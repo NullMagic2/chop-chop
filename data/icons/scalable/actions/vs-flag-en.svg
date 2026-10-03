@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="30" height="20" viewBox="0 0 30 20">
+  <defs><clipPath id="r"><rect width="30" height="20" rx="3"/></clipPath></defs>
+  <g clip-path="url(#r)">
+    <rect y="0.000" width="30" height="1.538" fill="#B22234"/>
+    <rect y="1.538" width="30" height="1.538" fill="#FFFFFF"/>
+    <rect y="3.077" width="30" height="1.538" fill="#B22234"/>
+    <rect y="4.615" width="30" height="1.538" fill="#FFFFFF"/>
+    <rect y="6.154" width="30" height="1.538" fill="#B22234"/>
+    <rect y="7.692" width="30" height="1.538" fill="#FFFFFF"/>
+    <rect y="9.231" width="30" height="1.538" fill="#B22234"/>
+    <rect y="10.769" width="30" height="1.538" fill="#FFFFFF"/>
+    <rect y="12.308" width="30" height="1.538" fill="#B22234"/>
+    <rect y="13.846" width="30" height="1.538" fill="#FFFFFF"/>
+    <rect y="15.385" width="30" height="1.538" fill="#B22234"/>
+    <rect y="16.923" width="30" height="1.538" fill="#FFFFFF"/>
+    <rect y="18.462" width="30" height="1.538" fill="#B22234"/>
+    <rect width="12" height="10.77" fill="#3C3B6E"/>
+    <circle cx="1.30" cy="1.50" r="0.55" fill="#FFF"/>
+    <circle cx="3.60" cy="1.50" r="0.55" fill="#FFF"/>
+    <circle cx="5.90" cy="1.50" r="0.55" fill="#FFF"/>
+    <circle cx="8.20" cy="1.50" r="0.55" fill="#FFF"/>
+    <circle cx="10.50" cy="1.50" r="0.55" fill="#FFF"/>
+    <circle cx="2.45" cy="4.05" r="0.55" fill="#FFF"/>
+    <circle cx="4.75" cy="4.05" r="0.55" fill="#FFF"/>
+    <circle cx="7.05" cy="4.05" r="0.55" fill="#FFF"/>
+    <circle cx="9.35" cy="4.05" r="0.55" fill="#FFF"/>
+    <circle cx="1.30" cy="6.60" r="0.55" fill="#FFF"/>
+    <circle cx="3.60" cy="6.60" r="0.55" fill="#FFF"/>
+    <circle cx="5.90" cy="6.60" r="0.55" fill="#FFF"/>
+    <circle cx="8.20" cy="6.60" r="0.55" fill="#FFF"/>
+    <circle cx="10.50" cy="6.60" r="0.55" fill="#FFF"/>
+    <circle cx="2.45" cy="9.15" r="0.55" fill="#FFF"/>
+    <circle cx="4.75" cy="9.15" r="0.55" fill="#FFF"/>
+    <circle cx="7.05" cy="9.15" r="0.55" fill="#FFF"/>
+    <circle cx="9.35" cy="9.15" r="0.55" fill="#FFF"/>
+
+  </g>
+  <rect x="0.5" y="0.5" width="29" height="19" rx="2.5" fill="none" stroke="#000" stroke-opacity="0.18"/>
+</svg>

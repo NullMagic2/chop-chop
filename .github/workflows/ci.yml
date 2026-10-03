@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    name: Linux (GTK 3)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev dpkg-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release
+      - run: ./packaging/build-deb.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chop-chop-deb
+          path: target/deb/*.deb
+
+  windows:
+    name: Windows (native Win32)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: windows
+      - name: Build
+        working-directory: windows
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chop-chop-exe
+          path: windows/target/release/chop-chop.exe
