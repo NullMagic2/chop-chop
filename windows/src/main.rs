@@ -60,8 +60,6 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 const ID_THUMB: usize = 200;
 const ID_DROP_TITLE: usize = 201;
 const ID_PREVIEW: usize = 202;
-const ID_SHOW_START: usize = 210;
-const ID_SHOW_END: usize = 211;
 const ID_TAB: usize = 212;
 const ID_TIMELINE: usize = 213;
 const ID_EVERY: usize = 220;
@@ -286,9 +284,6 @@ fn create_app(hwnd: HWND) {
 
     // ── Preview ──
     u.preview = ctl(hwnd, w!("ChopChopPreview"), "", 0, NONE, ID_PREVIEW);
-    u.frame_lbl = label(hwnd, 0);
-    u.show_start = button(hwnd, ID_SHOW_START, BS_AUTORADIOBUTTON | WS_GROUP.0 as i32);
-    u.show_end = button(hwnd, ID_SHOW_END, BS_AUTORADIOBUTTON);
     u.tab = ctl(hwnd, WC_TABCONTROLW, "", WS_TABSTOP.0 | WS_GROUP.0, NONE, ID_TAB);
     for i in 0..2 {
         let mut t: Vec<u16> = vec![0];
@@ -375,7 +370,7 @@ fn create_app(hwnd: HWND) {
     // (containers must sit *below* the controls drawn on them).
     unsafe {
         let order = [
-            u.lang_btn, u.open_btn, u.show_start, u.show_end, u.timeline, u.edits[E_START], u.edits[E_END], u.every_radio,
+            u.lang_btn, u.open_btn, u.timeline, u.edits[E_START], u.edits[E_END], u.every_radio,
             u.edits[E_MIN], u.edits[E_SEC], u.parts_radio, u.edits[E_PARTS], u.edits[E_WORKERS], u.out_edit, u.out_btn,
             u.edits[E_NAME], u.open_check, u.audio_btn, u.dir_btn, u.go_btn, u.list,
         ];
@@ -388,7 +383,7 @@ fn create_app(hwnd: HWND) {
             let _ = SetWindowPos(h, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
     }
-    u.tooltip = create_tooltip(hwnd, &[u.lang_btn, u.dir_btn, u.timeline, u.audio_btn, u.show_start, u.show_end, u.out_edit, u.thumb]);
+    u.tooltip = create_tooltip(hwnd, &[u.lang_btn, u.dir_btn, u.timeline, u.audio_btn, u.out_edit, u.thumb]);
 
     // Fonts for every child.
     unsafe {
@@ -446,7 +441,6 @@ fn create_app(hwnd: HWND) {
     }
     set_check(app.ui.open_check, true);
     set_check(app.ui.every_radio, true);
-    set_check(app.ui.show_start, true);
     enable(app.ui.audio_btn, false);
     app.set_out_dir(&videos_dir());
     set_flag(&app);
@@ -473,9 +467,6 @@ fn apply_texts(a: &mut App) {
         set_text(u.drop_title, &tr("Drop a video here…"));
         set_text(u.drop_sub, &tr("Open a video (Ctrl+O)"));
     }
-    set_text(u.frame_lbl, &format!("{}:", tr("Which frame the preview shows")));
-    set_text(u.show_start, &tr("Start"));
-    set_text(u.show_end, &tr("End"));
     set_text(u.start_lbl, &format!("{}:", tr("Start time")));
     set_text(u.end_lbl, &format!("{}:", tr("End time")));
     set_text(u.batch_head, &format!("{}:", tr("Split the whole video")));
@@ -591,19 +582,11 @@ pub fn layout(a: &mut App) {
     let itop = py + CAP;
     let ibot = py + ph - PAD;
     let tab_h = 214.0;
-    let frame_h = (iw * 9.0 / 16.0).min(ibot - itop - 32.0 - G - tab_h).max(120.0);
+    // The preview shows the frame at the handle that was moved last.
+    let frame_h = (iw * 9.0 / 16.0).min(ibot - itop - G - tab_h).max(120.0);
     place(u.preview, ix, itop, iw, frame_h, s);
-    let fy = itop + frame_h + 6.0;
-    let sw = tw(&txt(u.show_start)) + 30.0;
-    let ew = tw(&txt(u.show_end)) + 30.0;
-    place(u.show_end, ix + iw - ew, fy, ew, 26.0, s);
-    place(u.show_start, ix + iw - ew - 10.0 - sw, fy, sw, 26.0, s);
-    place(u.frame_lbl, ix, fy + 2.0, (iw - ew - sw - 20.0).max(10.0), LH, s);
     let custom = a.mode == Mode::Custom;
-    for h in [u.frame_lbl, u.show_start, u.show_end] {
-        show(h, custom);
-    }
-    let ty = fy + 26.0 + G;
+    let ty = itop + frame_h + G;
     let th = (ibot - ty).max(170.0);
     place(u.tab, ix, ty, iw, th, s);
     // The tab's page area.
@@ -770,8 +753,6 @@ fn tooltip_text(tool: usize) -> String {
             tr("Drag the handles to choose the start and end of the clip")
         } else if h == u.audio_btn {
             a.audio_tooltip()
-        } else if h == u.show_start || h == u.show_end {
-            tr("Which frame the preview shows")
         } else if h == u.out_edit {
             a.out_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default()
         } else if h == u.thumb {
@@ -984,9 +965,6 @@ fn command(id: usize, code: u32, ctl: HWND) {
             } else if unsafe { IsWindowEnabled(ctl_or(ctl, ID_GO)).as_bool() } {
                 start_export(None);
             }
-        }
-        ID_SHOW_START | ID_SHOW_END if code == BN_CLICKED => {
-            with_app(|a| a.set_focus_handle(if id == ID_SHOW_START { Handle::Start } else { Handle::End }, true));
         }
         ID_EVERY | ID_PARTS if code == BN_CLICKED => {
             with_app(|a| {

@@ -65,9 +65,6 @@ pub struct Ui {
     pub drop_info: HWND,
     pub preview_grp: HWND,
     pub preview: HWND,
-    pub frame_lbl: HWND,
-    pub show_start: HWND,
-    pub show_end: HWND,
     pub tab: HWND,
     pub timeline: HWND,
     pub start_lbl: HWND,
@@ -344,12 +341,10 @@ impl App {
         Some(v)
     }
 
-    /// Which frame the preview shows; keeps the Start/End radio buttons in sync.
+    /// The preview follows the handle that was moved (or whose time entry got focus) last.
     pub fn set_focus_handle(&mut self, h: Handle, refresh: bool) {
         let changed = self.focus != h;
         self.focus = h;
-        set_check(self.ui.show_start, h == Handle::Start);
-        set_check(self.ui.show_end, h == Handle::End);
         if changed && refresh {
             redraw(self.ui.timeline);
             self.request_preview(0);
@@ -607,7 +602,7 @@ impl App {
             enable(self.ui.spins[idx], on);
         }
         let u = &self.ui;
-        for h in [u.open_btn, u.thumb, u.drop_title, u.tab, u.timeline, u.show_start, u.show_end, u.every_radio, u.parts_radio, u.out_btn] {
+        for h in [u.open_btn, u.thumb, u.drop_title, u.tab, u.timeline, u.every_radio, u.parts_radio, u.out_btn] {
             enable(h, !running);
         }
         enable(u.audio_btn, !running && self.has_audio());

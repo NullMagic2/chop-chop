@@ -166,14 +166,6 @@ const TABLE: &[(&str, &str, &str, &str)] = &[
     ("NO VIDEO", "SEM VÍDEO", "SIN VÍDEO", "ΧΩΡΙΣ ΒΙΝΤΕΟ"),
     ("START", "INÍCIO", "INICIO", "ΑΡΧΗ"),
     ("END", "FIM", "FIN", "ΤΕΛΟΣ"),
-    ("Start", "Início", "Inicio", "Αρχή"),
-    ("End", "Fim", "Fin", "Τέλος"),
-    (
-        "Which frame the preview shows",
-        "Qual quadro a pré-visualização mostra",
-        "Qué fotograma muestra la vista previa",
-        "Ποιο καρέ δείχνει η προεπισκόπηση",
-    ),
     (
         "Drag the handles to choose the start and end of the clip",
         "Arraste as alças para escolher o início e o fim do clipe",

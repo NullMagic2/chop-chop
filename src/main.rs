@@ -50,9 +50,6 @@ struct Ui {
     preview: gtk::Image,
     preview_badge: gtk::Label,
     preview_spinner: gtk::Spinner,
-    frame_toggle: gtk::Box,
-    show_start: gtk::RadioButton,
-    show_end: gtk::RadioButton,
     timeline: gtk::DrawingArea,
     // custom selection
     start_entry: gtk::Entry,
@@ -410,29 +407,6 @@ fn build(app: &gtk::Application, initial: Option<PathBuf>) {
     preview_spinner.set_margin_top(14);
     preview_spinner.set_size_request(20, 20);
     overlay.add_overlay(&preview_spinner);
-    // Start / End frame toggle floats over the video (custom mode only)
-    let show_start = gtk::RadioButton::with_label("");
-    let show_end = gtk::RadioButton::with_label_from_widget(&show_start, "");
-    {
-        let (a, b) = (show_start.clone(), show_end.clone());
-        bind(move || {
-            a.set_label(&tr("Start"));
-            b.set_label(&tr("End"));
-        });
-    }
-    let frame_toggle = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    frame_toggle.style_context().add_class("linked");
-    frame_toggle.style_context().add_class("vs-overlay-seg");
-    for r in [&show_start, &show_end] {
-        r.set_mode(false);
-        frame_toggle.pack_start(r, false, false, 0);
-    }
-    frame_toggle.set_halign(gtk::Align::End);
-    frame_toggle.set_valign(gtk::Align::End);
-    frame_toggle.set_margin_end(12);
-    frame_toggle.set_margin_bottom(12);
-    ttip(&frame_toggle, "Which frame the preview shows");
-    overlay.add_overlay(&frame_toggle);
     pcontent.pack_start(&overlay, false, false, 0);
 
     let timeline = gtk::DrawingArea::new();
@@ -635,9 +609,6 @@ fn build(app: &gtk::Application, initial: Option<PathBuf>) {
         preview,
         preview_badge,
         preview_spinner,
-        frame_toggle,
-        show_start,
-        show_end,
         timeline,
         start_entry,
         end_entry,
@@ -853,19 +824,6 @@ fn connect_signals(ui: &Rc<Ui>, st: &St, open_btn: &gtk::Button) {
         });
     }
 
-    // Start/End frame toggle
-    {
-        let (ui2, st) = (ui.clone(), st.clone());
-        ui.show_start.connect_toggled(move |b| {
-            let h = if b.is_active() { Handle::Start } else { Handle::End };
-            if st.borrow().focus != h {
-                st.borrow_mut().focus = h;
-                ui2.timeline.queue_draw();
-                request_preview(&ui2, &st, 0);
-            }
-        });
-    }
-
     // Export audio → save dialog → audio-only job
     {
         let (ui2, st2) = (ui.clone(), st.clone());
@@ -940,7 +898,6 @@ fn connect_signals(ui: &Rc<Ui>, st: &St, open_btn: &gtk::Button) {
 fn mode_changed(ui: &Rc<Ui>, st: &St) {
     let mode = if ui.mode_stack.visible_child_name().as_deref() == Some("batch") { Mode::Batch } else { Mode::Custom };
     st.borrow_mut().mode = mode;
-    ui.frame_toggle.set_visible(mode == Mode::Custom);
     if st.borrow().info.as_ref().map(|i| !i.acodec.is_empty()).unwrap_or(false) {
         ui.audio_btn.set_tooltip_text(Some(&tr(match mode {
             Mode::Custom => "Save the selected range as WAV, MP3, OGG, FLAC, M4A or OPUS",
@@ -1128,18 +1085,10 @@ fn set_handle(st: &St, h: Handle, t: f64) -> Option<f64> {
     Some(v)
 }
 
-fn sync_frame_toggle(ui: &Ui, h: Handle) {
-    match h {
-        Handle::Start => ui.show_start.set_active(true),
-        Handle::End => ui.show_end.set_active(true),
-    }
-}
-
 fn move_handle(ui: &Rc<Ui>, st: &St, h: Handle, t: f64) {
     if set_handle(st, h, t).is_none() {
         return;
     }
-    sync_frame_toggle(ui, h);
     range_changed(ui, st);
     request_preview(ui, st, 140);
 }
@@ -1169,7 +1118,6 @@ fn entry_typed(ui: &Rc<Ui>, st: &St, e: &gtk::Entry, h: Handle) {
         e.style_context().add_class("error");
     }
     set_handle(st, h, t);
-    sync_frame_toggle(ui, h);
     ui.timeline.queue_draw();
     update_auto_name(ui, st);
     refresh_go(ui, st);
@@ -1535,7 +1483,6 @@ fn load_file(ui: &Rc<Ui>, st: &St, path: &Path) {
         s.focus = Handle::Start;
         s.name_auto = true;
     }
-    ui.show_start.set_active(true);
     ui.start_entry.set_sensitive(true);
     ui.end_entry.set_sensitive(true);
     ui.audio_btn.set_sensitive(has_audio);
