@@ -147,8 +147,8 @@ fn main() {
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            (1120.0 * s) as i32,
-            (780.0 * s) as i32,
+            (1240.0 * s) as i32,
+            (900.0 * s) as i32,
             None,
             None,
             Some(hinst),
@@ -246,11 +246,16 @@ fn button(p: HWND, id: usize, style: i32) -> HWND {
     ctl(p, w!("BUTTON"), "", WS_TABSTOP.0 | style as u32, NONE, id)
 }
 
+/// How much larger than the system message font the UI text is.
+const FONT_SCALE: f32 = 1.25;
+
 fn make_fonts(dpi: u32) -> (HFONT, HFONT) {
     unsafe {
         let mut ncm = NONCLIENTMETRICSW { cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
         let _ = SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS.0, ncm.cbSize, Some(&mut ncm as *mut _ as _), 0, dpi);
+        // The system message font (Segoe UI 9 pt), enlarged for readability.
         let mut lf = ncm.lfMessageFont;
+        lf.lfHeight = (lf.lfHeight as f32 * FONT_SCALE).round() as i32;
         let font = CreateFontIndirectW(&lf);
         lf.lfWeight = 600;
         lf.lfHeight = (lf.lfHeight as f32 * 1.3).round() as i32;
@@ -544,54 +549,62 @@ pub fn layout(a: &mut App) {
     let (cw, ch) = (rc.right as f32 / s, rc.bottom as f32 / s);
     let tw = |t: &str| text_width(a, t) as f32 / s;
     let txt = |h: HWND| text_of(h);
-    const M: f32 = 12.0;
-    const G: f32 = 10.0;
-    const EH: f32 = 23.0; // edit / label row height
-    const BH: f32 = 26.0; // button height
+    const M: f32 = 12.0; // window margin
+    const G: f32 = 10.0; // gap between groups
+    const EH: f32 = 29.0; // edit / radio row height
+    const BH: f32 = 32.0; // button height
+    const LH: f32 = 22.0; // label height
+    const LO: f32 = (EH - LH) / 2.0; // label offset that centres it on an edit row
+    const CAP: f32 = 30.0; // group box caption → first row
+    const PAD: f32 = 12.0; // group box inner padding
+    const WIDE_PAD: f32 = 20.0; // inner side padding of the Video and Export groups
     let avail = cw - 2.0 * M;
-    let right_w = (avail * 0.4).clamp(380.0, 500.0);
+    let right_w = (avail * 0.4).clamp(420.0, 560.0);
     let left_w = avail - G - right_w;
     let (lx, rx) = (M, M + left_w + G);
 
     // ── Language flag, top right ──
-    place(u.lang_btn, cw - M - 44.0, 8.0, 44.0, 32.0, s);
-    let top = 8.0 + 32.0 + 4.0;
+    place(u.lang_btn, cw - M - 48.0, 8.0, 48.0, 36.0, s);
+    let top = 8.0 + 36.0 + 4.0;
 
     // ── Video ──
-    let vh = 108.0;
+    let vh = CAP + 88.0 + 14.0;
     place(u.video_grp, lx, top, left_w, vh, s);
-    place(u.thumb, lx + 12.0, top + 22.0, 128.0, 72.0, s);
-    let ow = tw(&txt(u.open_btn)) + 32.0;
-    place(u.open_btn, lx + left_w - 12.0 - ow.max(88.0), top + 22.0, ow.max(88.0), BH, s);
-    let tx = lx + 152.0;
-    let tww = left_w - 164.0 - ow.max(88.0) - 12.0;
-    place(u.drop_title, tx, top + 22.0, tww, 26.0, s);
-    place(u.drop_sub, tx, top + 50.0, tww + ow.max(88.0) + 12.0, 18.0, s);
-    place(u.drop_info, tx, top + 72.0, tww + ow.max(88.0) + 12.0, 18.0, s);
+    let vx = lx + WIDE_PAD;
+    let vw = left_w - 2.0 * WIDE_PAD;
+    let ty0 = top + CAP;
+    place(u.thumb, vx, ty0 + 4.0, 142.0, 80.0, s);
+    let ow = (tw(&txt(u.open_btn)) + 36.0).max(100.0);
+    place(u.open_btn, vx + vw - ow, ty0, ow, BH, s);
+    let tx = vx + 142.0 + 16.0;
+    let full = vx + vw - tx;
+    place(u.drop_title, tx, ty0, full - ow - 12.0, 32.0, s);
+    place(u.drop_sub, tx, ty0 + 38.0, full, LH, s);
+    place(u.drop_info, tx, ty0 + 64.0, full, LH, s);
 
     // ── Preview ──
     let py = top + vh + G;
     let ph = ch - M - py;
     place(u.preview_grp, lx, py, left_w, ph, s);
-    let ix = lx + 12.0;
-    let iw = left_w - 24.0;
-    let itop = py + 22.0;
-    let ibot = py + ph - 12.0;
-    let tab_h = 172.0;
-    let frame_h = (iw * 9.0 / 16.0).min(ibot - itop - 30.0 - G - tab_h).max(120.0);
+    let ix = lx + PAD;
+    let iw = left_w - 2.0 * PAD;
+    let itop = py + CAP;
+    let ibot = py + ph - PAD;
+    let tab_h = 214.0;
+    let frame_h = (iw * 9.0 / 16.0).min(ibot - itop - 32.0 - G - tab_h).max(120.0);
     place(u.preview, ix, itop, iw, frame_h, s);
     let fy = itop + frame_h + 6.0;
-    let sw = tw(&txt(u.show_start)) + 26.0;
-    let ew = tw(&txt(u.show_end)) + 26.0;
-    place(u.show_end, ix + iw - ew, fy, ew, 22.0, s);
-    place(u.show_start, ix + iw - ew - 8.0 - sw, fy, sw, 22.0, s);
-    place(u.frame_lbl, ix, fy + 3.0, (iw - ew - sw - 16.0).max(10.0), 18.0, s);
+    let sw = tw(&txt(u.show_start)) + 30.0;
+    let ew = tw(&txt(u.show_end)) + 30.0;
+    place(u.show_end, ix + iw - ew, fy, ew, 26.0, s);
+    place(u.show_start, ix + iw - ew - 10.0 - sw, fy, sw, 26.0, s);
+    place(u.frame_lbl, ix, fy + 2.0, (iw - ew - sw - 20.0).max(10.0), LH, s);
     let custom = a.mode == Mode::Custom;
     for h in [u.frame_lbl, u.show_start, u.show_end] {
         show(h, custom);
     }
-    let ty = fy + 22.0 + G;
-    let th = (ibot - ty).max(140.0);
+    let ty = fy + 26.0 + G;
+    let th = (ibot - ty).max(170.0);
     place(u.tab, ix, ty, iw, th, s);
     // The tab's page area.
     let mut page = RECT {
@@ -604,35 +617,36 @@ pub fn layout(a: &mut App) {
         SendMessageW(u.tab, TCM_SETCURSEL, Some(WPARAM(if custom { 0 } else { 1 })), None);
         SendMessageW(u.tab, TCM_ADJUSTRECT, Some(WPARAM(0)), Some(LPARAM(&mut page as *mut _ as isize)));
     }
-    let (px, pyy, pw) = (page.left as f32 / s + 8.0, page.top as f32 / s + 8.0, (page.right - page.left) as f32 / s - 16.0);
+    let (px, pyy, pw) = (page.left as f32 / s + 10.0, page.top as f32 / s + 8.0, (page.right - page.left) as f32 / s - 20.0);
     // custom page
-    place(u.timeline, px, pyy, pw, 62.0, s);
-    let ly = pyy + 62.0 + 8.0;
-    let tcol = 140.0f32.max(tw(&txt(u.start_lbl)) + 4.0).max(tw(&txt(u.end_lbl)) + 4.0);
-    place(u.start_lbl, px, ly, tcol, 18.0, s);
-    place(u.edits[E_START], px, ly + 20.0, 130.0, EH, s);
-    place(u.end_lbl, px + tcol + 16.0, ly, tcol, 18.0, s);
-    place(u.edits[E_END], px + tcol + 16.0, ly + 20.0, 130.0, EH, s);
+    place(u.timeline, px, pyy, pw, 70.0, s);
+    let ly = pyy + 70.0 + 8.0;
+    let time_w: f32 = 170.0;
+    let tcol = time_w.max(tw(&txt(u.start_lbl)) + 4.0).max(tw(&txt(u.end_lbl)) + 4.0);
+    place(u.start_lbl, px, ly, tcol, LH, s);
+    place(u.edits[E_START], px, ly + LH + 4.0, time_w, EH, s);
+    place(u.end_lbl, px + tcol + 20.0, ly, tcol, LH, s);
+    place(u.edits[E_END], px + tcol + 20.0, ly + LH + 4.0, time_w, EH, s);
     for h in [u.timeline, u.start_lbl, u.end_lbl, u.edits[E_START], u.edits[E_END]] {
         show(h, custom);
     }
     // batch page
-    place(u.batch_head, px, pyy + 4.0, pw, 18.0, s);
-    let rw = (tw(&txt(u.every_radio)).max(tw(&txt(u.parts_radio))) + 28.0).max(90.0);
-    let r1 = pyy + 32.0;
-    let r2 = r1 + EH + 12.0;
+    place(u.batch_head, px, pyy + 4.0, pw, LH, s);
+    let rw = (tw(&txt(u.every_radio)).max(tw(&txt(u.parts_radio))) + 32.0).max(100.0);
+    let r1 = pyy + LH + 18.0;
+    let r2 = r1 + EH + 14.0;
     place(u.every_radio, px, r1, rw, EH, s);
     place(u.parts_radio, px, r2, rw, EH, s);
-    let sx = px + rw + 8.0;
-    let spin_w = 76.0;
+    let sx = px + rw + 10.0;
+    let spin_w = 92.0;
     place(u.edits[E_MIN], sx, r1, spin_w, EH, s);
     let mw = tw(&txt(u.min_lbl)) + 4.0;
-    place(u.min_lbl, sx + spin_w + 6.0, r1 + 3.0, mw, 18.0, s);
-    let sx2 = sx + spin_w + 6.0 + mw + 12.0;
+    place(u.min_lbl, sx + spin_w + 8.0, r1 + LO, mw, LH, s);
+    let sx2 = sx + spin_w + 8.0 + mw + 14.0;
     place(u.edits[E_SEC], sx2, r1, spin_w, EH, s);
-    place(u.sec_lbl, sx2 + spin_w + 6.0, r1 + 3.0, tw(&txt(u.sec_lbl)) + 4.0, 18.0, s);
+    place(u.sec_lbl, sx2 + spin_w + 8.0, r1 + LO, tw(&txt(u.sec_lbl)) + 4.0, LH, s);
     place(u.edits[E_PARTS], sx, r2, spin_w, EH, s);
-    place(u.parts_lbl, sx + spin_w + 6.0, r2 + 3.0, tw(&txt(u.parts_lbl)) + 4.0, 18.0, s);
+    place(u.parts_lbl, sx + spin_w + 8.0, r2 + LO, tw(&txt(u.parts_lbl)) + 4.0, LH, s);
     for h in [u.batch_head, u.every_radio, u.parts_radio, u.min_lbl, u.sec_lbl, u.parts_lbl, u.edits[E_MIN], u.edits[E_SEC], u.edits[E_PARTS]] {
         show(h, !custom);
     }
@@ -642,33 +656,33 @@ pub fn layout(a: &mut App) {
 
     // ── Export ──
     let ey = top;
-    let gx = rx + 12.0;
-    let gw = right_w - 24.0;
-    let lw = [u.workers_lbl, u.out_lbl, u.name_lbl].iter().map(|h| tw(&txt(*h))).fold(0.0, f32::max) + 10.0;
+    let gx = rx + WIDE_PAD;
+    let gw = right_w - 2.0 * WIDE_PAD;
+    let lw = [u.workers_lbl, u.out_lbl, u.name_lbl].iter().map(|h| tw(&txt(*h))).fold(0.0, f32::max) + 12.0;
     let fx = gx + lw;
     let fw = gw - lw;
-    let mut y = ey + 24.0;
-    place(u.workers_lbl, gx, y + 3.0, lw, 18.0, s);
+    let mut y = ey + CAP;
+    place(u.workers_lbl, gx, y + LO, lw, LH, s);
     place(u.edits[E_WORKERS], fx, y, spin_w, EH, s);
-    place(u.cores_lbl, fx + spin_w + 10.0, y + 3.0, fw - spin_w - 10.0, 18.0, s);
-    y += EH + 10.0;
-    let cbw = tw(&txt(u.out_btn)) + 24.0;
-    place(u.out_lbl, gx, y + 3.0, lw, 18.0, s);
-    place(u.out_edit, fx, y, fw - cbw - 6.0, EH, s);
-    place(u.out_btn, fx + fw - cbw, y - 1.0, cbw, BH - 1.0, s);
-    y += EH + 10.0;
+    place(u.cores_lbl, fx + spin_w + 12.0, y + LO, fw - spin_w - 12.0, LH, s);
+    y += EH + 12.0;
+    let cbw = tw(&txt(u.out_btn)) + 28.0;
+    place(u.out_lbl, gx, y + LO, lw, LH, s);
+    place(u.out_edit, fx, y, fw - cbw - 8.0, EH, s);
+    place(u.out_btn, fx + fw - cbw, y - 1.0, cbw, EH + 2.0, s);
+    y += EH + 12.0;
     let xw = tw(&txt(u.ext_lbl)) + 6.0;
-    place(u.name_lbl, gx, y + 3.0, lw, 18.0, s);
-    place(u.edits[E_NAME], fx, y, fw - xw - 4.0, EH, s);
-    place(u.ext_lbl, fx + fw - xw, y + 3.0, xw, 18.0, s);
-    y += EH + 10.0;
-    place(u.open_check, fx, y, fw, 20.0, s);
-    y += 20.0 + 12.0;
-    let aw = tw(&txt(u.audio_btn)) + 32.0;
-    place(u.audio_btn, fx, y, aw.max(120.0), BH, s);
-    let dw = tw(&txt(u.dir_btn)) + 32.0;
+    place(u.name_lbl, gx, y + LO, lw, LH, s);
+    place(u.edits[E_NAME], fx, y, fw - xw - 6.0, EH, s);
+    place(u.ext_lbl, fx + fw - xw, y + LO, xw, LH, s);
+    y += EH + 12.0;
+    place(u.open_check, fx, y, fw, 26.0, s);
+    y += 26.0 + 14.0;
+    let aw = (tw(&txt(u.audio_btn)) + 36.0).max(130.0);
+    place(u.audio_btn, fx, y, aw, BH, s);
+    let dw = tw(&txt(u.dir_btn)) + 36.0;
     place(u.dir_btn, gx + gw - dw, y, dw, BH, s);
-    y += BH + 14.0;
+    y += BH + 16.0;
     place(u.export_grp, rx, ey, right_w, y - ey, s);
     // Up-down buddies follow their edits.
     for i in SPINS {
@@ -680,21 +694,25 @@ pub fn layout(a: &mut App) {
 
     // ── Main button ──
     let gy = y + G;
-    place(u.go_btn, rx, gy, right_w, 36.0, s);
+    let go_h = 44.0;
+    place(u.go_btn, rx, gy, right_w, go_h, s);
 
     // ── Progress ──
-    let pgy = gy + 36.0 + G;
+    let pgy = gy + go_h + G;
     let pgh = ch - M - pgy;
     place(u.progress_grp, rx, pgy, right_w, pgh, s);
-    place(u.bar, gx, pgy + 26.0, gw - 56.0, 16.0, s);
-    place(u.percent, gx + gw - 50.0, pgy + 25.0, 50.0, 18.0, s);
-    let st_h = 36.0;
-    let st_y = pgy + pgh - 12.0 - st_h;
-    place(u.status, gx, st_y, gw, st_h, s);
-    let ly = pgy + 26.0 + 16.0 + 10.0;
-    place(u.list, gx, ly, gw, (st_y - 6.0 - ly).max(40.0), s);
-    let lwp = ((gw - 4.0) * s) as i32 - unsafe { GetSystemMetrics(SM_CXVSCROLL) };
-    for (c, frac) in [(0, 0.28), (1, 0.42), (2, 0.12), (3, 0.18)] {
+    let qx = rx + PAD;
+    let qw = right_w - 2.0 * PAD;
+    let pct_w = 60.0;
+    place(u.bar, qx, pgy + CAP + 2.0, qw - pct_w - 8.0, 18.0, s);
+    place(u.percent, qx + qw - pct_w, pgy + CAP, pct_w, LH, s);
+    let st_h = 2.0 * LH + 4.0;
+    let st_y = pgy + pgh - PAD - st_h;
+    place(u.status, qx, st_y, qw, st_h, s);
+    let ly = pgy + CAP + 2.0 + 18.0 + 12.0;
+    place(u.list, qx, ly, qw, (st_y - 8.0 - ly).max(40.0), s);
+    let lwp = ((qw - 4.0) * s) as i32 - unsafe { GetSystemMetrics(SM_CXVSCROLL) };
+    for (c, frac) in [(0, 0.17), (1, 0.48), (2, 0.17), (3, 0.18)] {
         unsafe {
             SendMessageW(u.list, LVM_SETCOLUMNWIDTH, Some(WPARAM(c)), Some(LPARAM((lwp as f32 * frac) as isize)));
         }
@@ -1067,7 +1085,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             WM_GETMINMAXINFO => {
                 let mmi = &mut *(lp.0 as *mut MINMAXINFO);
                 let s = GetDpiForWindow(hwnd) as f32 / 96.0;
-                mmi.ptMinTrackSize = POINT { x: (960.0 * s) as i32, y: (700.0 * s) as i32 };
+                mmi.ptMinTrackSize = POINT { x: (1080.0 * s) as i32, y: (800.0 * s) as i32 };
                 return LRESULT(0);
             }
             WM_DPICHANGED => {
@@ -1272,14 +1290,6 @@ fn handle_at(hwnd: HWND, a: &App, x: i32) -> Handle {
     }
 }
 
-fn blend(c: u32, with: u32, k: f32) -> u32 {
-    let ch = |sh: u32| -> u32 {
-        let (a, b) = (((c >> sh) & 0xff) as f32, ((with >> sh) & 0xff) as f32);
-        ((a * k + b * (1.0 - k)).round() as u32) << sh
-    };
-    ch(0) | ch(8) | ch(16)
-}
-
 fn paint_timeline(hwnd: HWND, dc: HDC, rc: RECT, a: &App) {
     unsafe {
         let _ = FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
@@ -1289,15 +1299,6 @@ fn paint_timeline(hwnd: HWND, dc: HDC, rc: RECT, a: &App) {
         let (x0, x1) = (g.x0 as i32, (g.x0 + g.w) as i32);
         let s = a.scale;
 
-        // Selected range: a highlight band behind the track.
-        if a.info.is_some() {
-            let (xs, xe) = (t_to_x(&g, a, a.start), t_to_x(&g, a, a.end));
-            let band = RECT { left: xs, top: g.cy - (7.0 * s) as i32, right: xe.max(xs + 1), bottom: g.cy + (7.0 * s) as i32 };
-            let hl = GetSysColor(COLOR_HIGHLIGHT);
-            let br = CreateSolidBrush(COLORREF(blend(hl, GetSysColor(COLOR_WINDOW), if enabled { 0.35 } else { 0.15 })));
-            let _ = FillRect(dc, &band, br);
-            let _ = DeleteObject(HGDIOBJ(br.0));
-        }
         // Track
         let track = RECT { left: x0, top: g.cy - (2.0 * s) as i32, right: x1, bottom: g.cy + (2.0 * s) as i32 };
         if !theme.is_invalid() {
@@ -1349,13 +1350,13 @@ fn paint_timeline(hwnd: HWND, dc: HDC, rc: RECT, a: &App) {
         let old = SelectObject(dc, HGDIOBJ(a.font.0));
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, COLORREF(GetSysColor(COLOR_GRAYTEXT)));
-        let ly = g.cy + (19.0 * s) as i32;
-        let mut r = RECT { left: (2.0 * s) as i32, top: ly, right: rc.right - (8.0 * s) as i32, bottom: rc.bottom };
+        let ly = g.cy + (20.0 * s) as i32;
+        let mut r = RECT { left: (2.0 * s) as i32, top: ly, right: rc.right - (14.0 * s) as i32, bottom: rc.bottom };
         let dur = a.info.as_ref().map(|i| i.duration).unwrap_or(0.0);
         draw_text(dc, "00:00:00", &mut r.clone(), DT_LEFT | DT_SINGLELINE);
         draw_text(dc, &splitter::fmt_time(dur), &mut r.clone(), DT_RIGHT | DT_SINGLELINE);
         if a.info.is_some() {
-            SetTextColor(dc, COLORREF(GetSysColor(COLOR_HIGHLIGHT)));
+            SetTextColor(dc, COLORREF(GetSysColor(COLOR_WINDOWTEXT)));
             draw_text(dc, &splitter::fmt_time(a.end - a.start), &mut r, DT_CENTER | DT_SINGLELINE);
         }
         SelectObject(dc, old);
