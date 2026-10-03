@@ -133,6 +133,8 @@ pub struct App {
     pub card_img: Option<Image>,
     pub rx: Option<mpsc::Receiver<Msg>>,
     pub status: String,
+    /// " · NVIDIA NVENC" etc. while a video export runs.
+    pub encoder_note: String,
 }
 
 /// Thumbnails decoded on worker threads, handed over via `WM_APP_THUMB`.
@@ -707,7 +709,7 @@ impl App {
         self.set_overall(0.0, PBST_NORMAL);
         let chunks = tasks.iter().filter(|t| matches!(t.kind, TaskKind::VideoChunk { .. })).count();
         let w = job.workers.min(n).to_string();
-        let status = match (&audio, mode) {
+        let mut status = match (&audio, mode) {
             (None, Mode::Custom) => trf(
                 "Encoding {len} — split into {n} chunk(s) so every core helps…",
                 &[("len", splitter::fmt_ts(end_t - start_t)), ("n", chunks.to_string())],
@@ -719,6 +721,9 @@ impl App {
                 &[("n", n.to_string()), ("fmt", f.label().to_string()), ("w", w)],
             ),
         };
+        // Which encoder does the work (the GPU's, or libx264 on the CPU), shown while it runs.
+        self.encoder_note = if audio.is_none() { format!(" · {}", splitter::video_encoder().label()) } else { String::new() };
+        status.push_str(&self.encoder_note);
         self.set_status(&status);
         self.set_running_ui(true);
         let (tx, rx) = mpsc::channel::<Msg>();
@@ -808,10 +813,12 @@ impl App {
         }
         if frac > 0.02 && elapsed > 1.0 && !self.cancelling {
             let eta = elapsed / frac * (1.0 - frac);
-            self.set_status(&trf(
+            let eta_text = trf(
                 "{t} elapsed · about {left} left",
                 &[("t", splitter::fmt_time(elapsed)), ("left", splitter::fmt_time(eta))],
-            ));
+            );
+            let note = self.encoder_note.clone();
+            self.set_status(&format!("{eta_text}{note}"));
         }
         None
     }

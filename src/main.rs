@@ -657,7 +657,12 @@ fn build(app: &gtk::Application, initial: Option<PathBuf>) {
     window.show_all();
     mode_changed(&ui, &st);
 
-    if !splitter::ffmpeg_available() {
+    if splitter::ffmpeg_available() {
+        // Find a working GPU encoder in the background, so the first export doesn't wait.
+        std::thread::spawn(|| {
+            splitter::video_encoder();
+        });
+    } else {
         error_dialog(
             &ui.window,
             &tr("FFmpeg was not found"),
@@ -1654,7 +1659,7 @@ fn start(ui: &Rc<Ui>, st: &St, audio: Option<(AudioFormat, PathBuf)>) {
     let workers = job.workers;
     let chunks = tasks.iter().filter(|t| matches!(t.kind, TaskKind::VideoChunk { .. })).count();
     let w = workers.min(n).to_string();
-    ui.status.set_text(&match (&audio, mode) {
+    let mut status = match (&audio, mode) {
         (None, Mode::Custom) => trf(
             "Encoding {len} — split into {n} chunk(s) so every core helps…",
             &[("len", splitter::fmt_ts(end_t - start_t)), ("n", chunks.to_string())],
@@ -1665,7 +1670,11 @@ fn start(ui: &Rc<Ui>, st: &St, audio: Option<(AudioFormat, PathBuf)>) {
             "Exporting {n} {fmt} files, {w} at a time…",
             &[("n", n.to_string()), ("fmt", f.label().to_string()), ("w", w)],
         ),
-    });
+    };
+    // Which encoder does the work (the GPU's, or libx264 on the CPU), shown while it runs.
+    let encoder_note = if audio.is_none() { format!(" · {}", splitter::video_encoder().label()) } else { String::new() };
+    status.push_str(&encoder_note);
+    ui.status.set_text(&status);
     set_running_ui(ui, st, true);
 
     let (tx, rx) = mpsc::channel::<Msg>();
@@ -1766,10 +1775,11 @@ fn start(ui: &Rc<Ui>, st: &St, audio: Option<(AudioFormat, PathBuf)>) {
         }
         if frac > 0.02 && elapsed > 1.0 {
             let eta = elapsed / frac * (1.0 - frac);
-            ui.status.set_text(&trf(
+            let eta_text = trf(
                 "{t} elapsed · about {left} left",
                 &[("t", splitter::fmt_time(elapsed)), ("left", splitter::fmt_time(eta))],
-            ));
+            );
+            ui.status.set_text(&format!("{eta_text}{encoder_note}"));
         }
         glib::ControlFlow::Continue
     });

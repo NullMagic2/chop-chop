@@ -1,5 +1,11 @@
 //! FFmpeg-backed cutting engine. All cuts are frame-accurate re-encodes.
 //!
+//! Video is encoded on the GPU with its maker's encoder — NVIDIA NVENC, AMD AMF or Intel
+//! Quick Sync (VA-API is the Linux fallback for AMD/Intel) — and with libx264 on the CPU
+//! when there is no usable GPU. The GPU is detected once and checked with a short test
+//! encode; it is invisible to the user. If a GPU encode fails later, that piece is redone
+//! on the CPU and the GPU is not used again.
+//!
 //! * Custom selection: the range is divided into N chunks that are encoded
 //!   **in parallel** (one FFmpeg per CPU worker), the audio is encoded once,
 //!   and everything is joined losslessly into a single clip.
@@ -12,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 
 #[derive(Clone, Debug, Default)]
@@ -244,14 +250,261 @@ pub fn thumbnail(path: &Path, t: f64, w: u32, h: u32) -> Result<Vec<u8>, String>
     Ok(out.stdout)
 }
 
+
+// ───────────────────────── video encoder selection ─────────────────────────
+
+/// The H.264 encoder used for video.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoEncoder {
+    /// NVIDIA (NVENC)
+    Nvenc,
+    /// Intel Quick Sync
+    Qsv,
+    /// AMD (AMF, Windows)
+    Amf,
+    /// Intel / AMD through VA-API (Linux)
+    Vaapi,
+    /// libx264 on the CPU
+    X264,
+}
+
+impl VideoEncoder {
+    pub fn is_hardware(self) -> bool {
+        self != VideoEncoder::X264
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VideoEncoder::Nvenc => "NVIDIA NVENC",
+            VideoEncoder::Qsv => "Intel Quick Sync",
+            VideoEncoder::Amf => "AMD AMF",
+            VideoEncoder::Vaapi => "VA-API",
+            VideoEncoder::X264 => "libx264 (CPU)",
+        }
+    }
+
+    /// How many encodes the hardware runs at once without hitting session limits
+    /// (consumer NVIDIA cards, for example, cap concurrent NVENC sessions).
+    pub fn slots(self) -> usize {
+        match self {
+            VideoEncoder::Nvenc => 3,
+            VideoEncoder::X264 => usize::MAX,
+            _ => 2,
+        }
+    }
+
+    fn from_name(name: &str) -> Option<VideoEncoder> {
+        Some(match name.trim().to_lowercase().as_str() {
+            "nvenc" | "nvidia" => VideoEncoder::Nvenc,
+            "qsv" | "quicksync" | "intel" => VideoEncoder::Qsv,
+            "amf" | "amd" => VideoEncoder::Amf,
+            "vaapi" => VideoEncoder::Vaapi,
+            "cpu" | "x264" | "libx264" | "software" => VideoEncoder::X264,
+            _ => return None,
+        })
+    }
+
+    /// Options that must come before `-i` (VA-API needs its device).
+    fn input_args(self) -> Vec<String> {
+        match self {
+            VideoEncoder::Vaapi => vec!["-vaapi_device".into(), vaapi_device().to_string_lossy().into_owned()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Video codec options. Quality targets roughly match libx264 at CRF 20.
+    fn output_args(self, threads: usize) -> Vec<String> {
+        let a: &[&str] = match self {
+            VideoEncoder::Nvenc => &[
+                "-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "21", "-b:v", "0",
+                "-profile:v", "high", "-pix_fmt", "yuv420p",
+            ],
+            VideoEncoder::Qsv => &["-c:v", "h264_qsv", "-preset", "medium", "-global_quality", "21", "-pix_fmt", "nv12"],
+            VideoEncoder::Amf => &[
+                "-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", "20", "-qp_p", "22", "-qp_b", "24",
+                "-pix_fmt", "nv12",
+            ],
+            VideoEncoder::Vaapi => &["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-qp", "21"],
+            VideoEncoder::X264 => &["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p"],
+        };
+        let mut v: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+        if self == VideoEncoder::X264 {
+            v.extend(["-threads".to_string(), threads.to_string()]);
+        }
+        v
+    }
+}
+
+/// First DRM render node, used by VA-API.
+fn vaapi_device() -> PathBuf {
+    (128..136)
+        .map(|n| PathBuf::from(format!("/dev/dri/renderD{n}")))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("/dev/dri/renderD128"))
+}
+
+/// GPU makers, in the order they are preferred (a dedicated card before integrated graphics).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GpuVendor {
+    Nvidia,
+    Amd,
+    Intel,
+}
+
+impl GpuVendor {
+    /// From a PCI vendor id.
+    pub fn from_pci_id(id: u32) -> Option<GpuVendor> {
+        match id {
+            0x10DE => Some(GpuVendor::Nvidia),
+            0x1002 | 0x1022 => Some(GpuVendor::Amd),
+            0x8086 => Some(GpuVendor::Intel),
+            _ => None,
+        }
+    }
+
+    /// The maker's own encoder: NVIDIA → NVENC, AMD → AMF, Intel → Quick Sync. On Linux,
+    /// where AMF and Quick Sync often aren't available, AMD and Intel can also use VA-API.
+    fn encoders(self) -> &'static [VideoEncoder] {
+        match self {
+            GpuVendor::Nvidia => &[VideoEncoder::Nvenc],
+            GpuVendor::Amd if cfg!(windows) => &[VideoEncoder::Amf],
+            GpuVendor::Amd => &[VideoEncoder::Amf, VideoEncoder::Vaapi],
+            GpuVendor::Intel if cfg!(windows) => &[VideoEncoder::Qsv],
+            GpuVendor::Intel => &[VideoEncoder::Qsv, VideoEncoder::Vaapi],
+        }
+    }
+}
+
+static GPUS: OnceLock<Vec<GpuVendor>> = OnceLock::new();
+
+/// Tell the engine which GPUs are installed. The Windows front end calls this at startup
+/// (it asks DXGI); elsewhere the engine reads them from sysfs itself.
+#[allow(dead_code)]
+pub fn set_gpu_vendors(mut vendors: Vec<GpuVendor>) {
+    vendors.sort();
+    vendors.dedup();
+    let _ = GPUS.set(vendors);
+}
+
+/// The installed GPUs, most preferred first.
+pub fn gpu_vendors() -> &'static [GpuVendor] {
+    GPUS.get_or_init(|| {
+        let mut v = detect_gpus();
+        v.sort();
+        v.dedup();
+        v
+    })
+}
+
+/// Linux: the PCI vendor of every DRM card (`/sys/class/drm/cardN/device/vendor`).
+fn detect_gpus() -> Vec<GpuVendor> {
+    let Ok(dir) = std::fs::read_dir("/sys/class/drm") else { return Vec::new() };
+    dir.filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.strip_prefix("card").is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+        })
+        .filter_map(|e| std::fs::read_to_string(e.path().join("device/vendor")).ok())
+        .filter_map(|id| u32::from_str_radix(id.trim().trim_start_matches("0x"), 16).ok())
+        .filter_map(GpuVendor::from_pci_id)
+        .collect()
+}
+
+static DETECTED: OnceLock<VideoEncoder> = OnceLock::new();
+/// Set when a GPU encode failed during a job: everything after that uses the CPU.
+static HW_BROKEN: AtomicBool = AtomicBool::new(false);
+
+/// The encoder to use: the installed GPU's own encoder (NVIDIA → NVENC, AMD → AMF,
+/// Intel → Quick Sync) if a short test encode with it works, else libx264 on the CPU.
+/// The first call runs the test (about a second); later calls are instant.
+/// `CHOP_CHOP_ENCODER=nvenc|qsv|amf|vaapi|cpu` forces a choice (for testing).
+pub fn video_encoder() -> VideoEncoder {
+    if HW_BROKEN.load(Ordering::Relaxed) {
+        return VideoEncoder::X264;
+    }
+    *DETECTED.get_or_init(|| {
+        if let Some(forced) = std::env::var("CHOP_CHOP_ENCODER").ok().and_then(|v| VideoEncoder::from_name(&v)) {
+            return forced;
+        }
+        gpu_vendors()
+            .iter()
+            .flat_map(|v| v.encoders().iter().copied())
+            .find(|e| encoder_works(*e))
+            .unwrap_or(VideoEncoder::X264)
+    })
+}
+
+/// Encode a few frames of a test pattern with `enc`; true if FFmpeg succeeds.
+fn encoder_works(enc: VideoEncoder) -> bool {
+    if enc == VideoEncoder::Vaapi && !vaapi_device().exists() {
+        return false;
+    }
+    let mut c = tool("ffmpeg");
+    c.args(["-hide_banner", "-nostdin", "-loglevel", "error"])
+        .args(enc.input_args())
+        .args(["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30", "-frames:v", "10"])
+        .args(enc.output_args(1))
+        .args(["-f", "null", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let Ok(mut child) = c.spawn() else { return false };
+    // A broken driver can hang; give up after 15 s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => thread::sleep(std::time::Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Limits how many GPU encodes run at the same time.
+struct Slots {
+    free: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl Slots {
+    fn new(n: usize) -> Slots {
+        Slots { free: Mutex::new(n), cv: Condvar::new() }
+    }
+
+    /// Wait for a slot; returns false if the job was cancelled meanwhile.
+    fn acquire(&self, cancel: &AtomicBool) -> bool {
+        let mut free = self.free.lock().unwrap();
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return false;
+            }
+            if *free > 0 {
+                *free -= 1;
+                return true;
+            }
+            free = self.cv.wait_timeout(free, std::time::Duration::from_millis(200)).unwrap().0;
+        }
+    }
+
+    fn release(&self) {
+        *self.free.lock().unwrap() += 1;
+        self.cv.notify_one();
+    }
+}
+
 /// Decide how the job will be executed (also used by the UI to draw the task list).
 pub fn plan_tasks(job: &CutJob) -> Vec<Task> {
     let len = (job.end - job.start).max(0.0);
     let mut tasks = Vec::new();
     if job.output.is_some() {
         {
-            // One chunk per worker, but never chunks shorter than ~2 s.
-            let n = job.workers.max(1).min(((len / 2.0).floor() as usize).max(1));
+            // One chunk per worker, but never chunks shorter than ~2 s. A GPU runs only a
+            // few encodes at once, so there are no more chunks than it has slots.
+            let n = job.workers.max(1).min(video_encoder().slots()).min(((len / 2.0).floor() as usize).max(1));
             let chunk = len / n as f64;
             // Chunk boundaries are snapped to whole frames so no frame is duplicated or lost.
             let snap = |t: f64| if job.fps > 0.0 { (t * job.fps).round() / job.fps } else { t };
@@ -355,6 +608,12 @@ pub fn run(job: CutJob, tasks: Vec<Task>, tx: Sender<Msg>, cancel: Arc<AtomicBoo
             .count()
             .max(1);
         let threads_per_job = (cores() / video_jobs.min(job.workers.max(1))).max(1);
+        let encoder = video_encoder();
+        let ctx = Arc::new(Ctx {
+            encoder,
+            slots: Slots::new(encoder.slots()),
+            used: Mutex::new(vec![None; tasks.len()]),
+        });
         let _ = std::fs::create_dir_all(&job.tmp_dir);
 
         // ---- parallel phase: worker pool pulls tasks from a shared queue ----
@@ -366,14 +625,14 @@ pub fn run(job: CutJob, tasks: Vec<Task>, tx: Sender<Msg>, cancel: Arc<AtomicBoo
         let handles: Vec<_> = (0..pool)
             .map(|_| {
                 let (queue, tasks, tx, cancel, job) = (queue.clone(), tasks.clone(), tx.clone(), cancel.clone(), job.clone());
-                let (failed, first_err) = (failed.clone(), first_err.clone());
+                let (failed, first_err, ctx) = (failed.clone(), first_err.clone(), ctx.clone());
                 thread::spawn(move || loop {
                     if cancel.load(Ordering::Relaxed) || failed.load(Ordering::Relaxed) {
                         break;
                     }
                     let Some(i) = queue.lock().unwrap().pop_front() else { break };
                     let _ = tx.send(Msg::Started(i));
-                    let res = run_task(&job, &tasks[i], i, threads_per_job, &tx, &cancel);
+                    let res = run_task(&job, &tasks[i], i, threads_per_job, &ctx, &tx, &cancel);
                     if let Err(e) = &res {
                         if !cancel.load(Ordering::Relaxed) {
                             failed.store(true, Ordering::Relaxed);
@@ -398,7 +657,7 @@ pub fn run(job: CutJob, tasks: Vec<Task>, tx: Sender<Msg>, cancel: Arc<AtomicBoo
         if result.is_ok() {
             if let Some(j) = tasks.iter().position(|t| matches!(t.kind, TaskKind::Join)) {
                 let _ = tx.send(Msg::Started(j));
-                let r = join(&job, &tasks);
+                let r = join(&job, &tasks, &ctx);
                 if let Err(e) = &r {
                     result = Err(e.clone());
                 }
@@ -421,11 +680,22 @@ fn base_cmd() -> Command {
     c
 }
 
-fn run_task(job: &CutJob, task: &Task, idx: usize, threads: usize, tx: &Sender<Msg>, cancel: &AtomicBool) -> Result<(), String> {
-    let len = job.end - job.start;
-    let (mut cmd, dur) = match &task.kind {
+/// Shared by the worker threads of one job.
+struct Ctx {
+    /// The encoder chosen for this job.
+    encoder: VideoEncoder,
+    /// GPU encodes allowed at once.
+    slots: Slots,
+    /// Which encoder actually produced each video task (indexed like `tasks`).
+    used: Mutex<Vec<Option<VideoEncoder>>>,
+}
+
+/// FFmpeg command for a video chunk or part encoded with `enc`.
+fn video_cmd(job: &CutJob, kind: &TaskKind, enc: VideoEncoder, threads: usize) -> (Command, f64) {
+    let mut c = base_cmd();
+    c.args(enc.input_args());
+    match kind {
         TaskKind::VideoChunk { start, len, file } => {
-            let mut c = base_cmd();
             // Boundaries sit exactly on frame times; flooring to the millisecond keeps the
             // seek inside (previous frame, this frame], and an exact frame count avoids overlap.
             c.args(["-ss", &format!("{:.3}", (start * 1000.0).floor() / 1000.0)])
@@ -436,14 +706,10 @@ fn run_task(job: &CutJob, task: &Task, idx: usize, threads: usize, tx: &Sender<M
             } else {
                 c.args(["-t", &format!("{:.3}", len)]);
             }
-            c.args(["-map", "0:v:0", "-an", "-sn", "-dn"])
-                .args(["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p"])
-                .args(["-threads", &threads.to_string()])
-                .arg(file);
+            c.args(["-map", "0:v:0", "-an", "-sn", "-dn"]).args(enc.output_args(threads)).arg(file);
             (c, *len)
         }
         TaskKind::VideoPart { start, len, file } => {
-            let mut c = base_cmd();
             c.args(["-ss", &format!("{:.3}", (start * 1000.0).floor() / 1000.0)])
                 .arg("-i")
                 .arg(&job.input)
@@ -452,11 +718,46 @@ fn run_task(job: &CutJob, task: &Task, idx: usize, threads: usize, tx: &Sender<M
                 c.args(["-frames:v", &((len * job.fps).round().max(1.0) as u64).to_string()]);
             }
             c.args(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"])
-                .args(["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p"])
+                .args(enc.output_args(threads))
                 .args(["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"])
-                .args(["-threads", &threads.to_string()])
                 .arg(file);
             (c, *len)
+        }
+        _ => unreachable!("video_cmd for a non-video task"),
+    }
+}
+
+fn run_task(job: &CutJob, task: &Task, idx: usize, threads: usize, ctx: &Ctx, tx: &Sender<Msg>, cancel: &AtomicBool) -> Result<(), String> {
+    let len = job.end - job.start;
+    let (mut cmd, dur) = match &task.kind {
+        TaskKind::VideoChunk { .. } | TaskKind::VideoPart { .. } => {
+            // GPU first (a few at a time); on failure redo this piece on the CPU and stop
+            // using the GPU for the rest of the session.
+            if ctx.encoder.is_hardware() && !HW_BROKEN.load(Ordering::Relaxed) {
+                if !ctx.slots.acquire(cancel) {
+                    return Err("Cancelled".into());
+                }
+                let (mut c, d) = video_cmd(job, &task.kind, ctx.encoder, threads);
+                let res = run_ffmpeg(&mut c, d, idx, tx, cancel);
+                ctx.slots.release();
+                match res {
+                    Ok(()) => {
+                        ctx.used.lock().unwrap()[idx] = Some(ctx.encoder);
+                        return Ok(());
+                    }
+                    Err(e) if cancel.load(Ordering::Relaxed) => return Err(e),
+                    Err(_) => {
+                        HW_BROKEN.store(true, Ordering::Relaxed);
+                        let _ = tx.send(Msg::Progress(idx, 0.0));
+                    }
+                }
+            }
+            let (mut c, d) = video_cmd(job, &task.kind, VideoEncoder::X264, threads.max(1));
+            let res = run_ffmpeg(&mut c, d, idx, tx, cancel);
+            if res.is_ok() {
+                ctx.used.lock().unwrap()[idx] = Some(VideoEncoder::X264);
+            }
+            return res;
         }
         TaskKind::AudioExport { format, start, len, file } => {
             let mut c = base_cmd();
@@ -484,7 +785,7 @@ fn run_task(job: &CutJob, task: &Task, idx: usize, threads: usize, tx: &Sender<M
     run_ffmpeg(&mut cmd, dur, idx, tx, cancel)
 }
 
-fn join(job: &CutJob, tasks: &[Task]) -> Result<(), String> {
+fn join(job: &CutJob, tasks: &[Task], ctx: &Ctx) -> Result<(), String> {
     let list = job.tmp_dir.join("list.txt");
     let mut f = std::fs::File::create(&list).map_err(|e| e.to_string())?;
     for t in tasks {
@@ -494,6 +795,13 @@ fn join(job: &CutJob, tasks: &[Task]) -> Result<(), String> {
         }
     }
     drop(f);
+    // Chunks from one encoder are joined losslessly. If the GPU failed half-way and some
+    // chunks came from the CPU instead, their streams differ, so the video is re-encoded.
+    let used = ctx.used.lock().unwrap();
+    let mut encoders = tasks.iter().enumerate().filter(|(_, t)| matches!(t.kind, TaskKind::VideoChunk { .. })).map(|(i, _)| used[i]);
+    let first = encoders.next().flatten();
+    let mixed = encoders.any(|e| e != first);
+    drop(used);
     let mut c = tool("ffmpeg");
     c.args(["-hide_banner", "-nostdin", "-y", "-loglevel", "error"])
         .args(["-f", "concat", "-safe", "0", "-i"])
@@ -505,7 +813,12 @@ fn join(job: &CutJob, tasks: &[Task]) -> Result<(), String> {
     if let Some(a) = &audio {
         c.arg("-i").arg(a).args(["-map", "0:v:0", "-map", "1:a:0"]);
     }
-    c.args(["-c", "copy", "-movflags", "+faststart"]).arg(job.output.as_ref().expect("join without video output"));
+    if mixed {
+        c.args(VideoEncoder::X264.output_args(cores())).args(["-c:a", "copy"]);
+    } else {
+        c.args(["-c", "copy"]);
+    }
+    c.args(["-movflags", "+faststart"]).arg(job.output.as_ref().expect("join without video output"));
     let out = c.output().map_err(|e| e.to_string())?;
     if out.status.success() {
         Ok(())

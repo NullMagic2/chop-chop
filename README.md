@@ -59,7 +59,7 @@ Get the files from the [latest release](https://github.com/NullMagic2/chop-chop/
 ### Ubuntu 24.04 / 26.04
 
 ```bash
-sudo apt install ./chop-chop_1.7.4_amd64.deb
+sudo apt install ./chop-chop_1.8.0_amd64.deb
 ```
 
 This also installs `ffmpeg` if you don't have it. Launch **Chop Chop Splitter** from the app
@@ -68,7 +68,7 @@ packages.
 
 ### Windows 10 / 11 (64-bit)
 
-Run `chop-chop-1.7.4-windows-x64-setup.exe`. FFmpeg is included, so there is nothing else
+Run `chop-chop-1.8.0-windows-x64-setup.exe`. FFmpeg is included, so there is nothing else
 to install.
 
 ## Build from source
@@ -95,7 +95,7 @@ cargo build --release                 # binary: windows\target\release\chop-chop
 
 ```powershell
 cd windows\installer
-makensis -DVERSION=1.7.4 -DAPPDIR=..\target\release -DFFMPEG=C:\path\to\ffmpeg\bin chop-chop.nsi
+makensis -DVERSION=1.8.0 -DAPPDIR=..\target\release -DFFMPEG=C:\path\to\ffmpeg\bin chop-chop.nsi
 ```
 
 You can also cross-compile from Linux with `rustup target add x86_64-pc-windows-gnu` and
@@ -104,7 +104,7 @@ You can also cross-compile from Linux with `rustup target add x86_64-pc-windows-
 
 ### Releases
 
-Pushing a tag such as `v1.7.4`, or running the [Release workflow](.github/workflows/release.yml)
+Pushing a tag such as `v1.8.0`, or running the [Release workflow](.github/workflows/release.yml)
 by hand with that tag name, builds the `.deb` on Ubuntu 24.04 and the Windows installer and
 publishes both to a GitHub release.
 

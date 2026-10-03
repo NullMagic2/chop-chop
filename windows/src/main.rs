@@ -97,6 +97,26 @@ fn videos_dir() -> PathBuf {
     std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// The GPU makers of the installed graphics adapters (DXGI), for picking the video encoder.
+fn gpu_vendors() -> Vec<splitter::GpuVendor> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE};
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else { return out };
+        let mut i = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            if let Ok(desc) = adapter.GetDesc1() {
+                let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+                if let (false, Some(v)) = (software, splitter::GpuVendor::from_pci_id(desc.VendorId)) {
+                    out.push(v);
+                }
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
 fn lparam_xy(lp: LPARAM) -> (i32, i32) {
     ((lp.0 & 0xffff) as i16 as i32, ((lp.0 >> 16) & 0xffff) as i16 as i32)
 }
@@ -111,6 +131,7 @@ fn main() {
         let _ = InitCommonControlsEx(&icc);
     }
     i18n::init_with_locale(system_locale());
+    splitter::set_gpu_vendors(gpu_vendors());
     let hinst = hinstance();
     unsafe {
         let icon = LoadImageW(Some(hinst), PCWSTR(1 as _), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED)
@@ -423,6 +444,7 @@ fn create_app(hwnd: HWND) {
         card_img: None,
         rx: None,
         status: String::new(),
+        encoder_note: String::new(),
     };
     for (i, v) in [(E_MIN, 5.0), (E_SEC, 0.0), (E_PARTS, 4.0), (E_WORKERS, cores as f64)] {
         let (lo, hi) = app.spin_range(i);
@@ -1112,7 +1134,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 return LRESULT(0);
             }
             WM_APP_STARTUP => {
-                if !splitter::ffmpeg_available() {
+                if splitter::ffmpeg_available() {
+                    // Find a working GPU encoder in the background, so the first export doesn't wait.
+                    std::thread::spawn(|| {
+                        splitter::video_encoder();
+                    });
+                } else {
                     show_error(
                         &tr("FFmpeg was not found"),
                         &tr("Chop Chop Splitter uses FFmpeg to cut videos. Reinstall Chop Chop Splitter, or put ffmpeg.exe and ffprobe.exe next to chop-chop.exe or on your PATH."),
