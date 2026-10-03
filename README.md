@@ -45,10 +45,6 @@ use the same cutting engine and translations.
 
 ![Batch split into 4 equal parts, encoding in parallel](docs/screenshots/linux-batch-split.png)
 
-### Languages
-
-![Language picker](docs/screenshots/linux-languages.png)
-
 ## Windows
 
 The Windows build is a native Win32 application with the same layout as the Ubuntu version.
@@ -57,16 +53,6 @@ list view), the system font and theme, and the Windows file dialogs. It supports
 per-monitor DPI scaling.
 
 ![Chop Chop Splitter on Windows](docs/screenshots/windows-custom-selection.png)
-
-![Batch split on Windows](docs/screenshots/windows-batch-split.png)
-
-<sub>Screenshots of the Windows build were taken under Wine. On Windows 10/11 the controls
-use the native visual style and the Segoe UI font.</sub>
-
-The installer bundles FFmpeg, adds Start-menu (and optionally desktop) shortcuts and an
-*Open with* entry for video files, and can be removed from *Settings → Apps*.
-
-<p align="center"><img src="docs/screenshots/windows-installer.png" width="498" alt="Windows installer"></p>
 
 ## Install
 
