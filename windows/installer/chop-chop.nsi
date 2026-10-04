@@ -3,6 +3,11 @@
 ; Build (from the repository root, after `cargo build --release` in windows/):
 ;   makensis -DVERSION=1.8.0 -DAPPDIR=windows\target\release -DFFMPEG=path\to\ffmpeg\bin windows\installer\chop-chop.nsi
 ; APPDIR holds chop-chop.exe; FFMPEG holds ffmpeg.exe, ffprobe.exe and their DLLs.
+;
+; For a 64-bit setup.exe add "-XTarget amd64-unicode" (before the script name). That needs an
+; NSIS with amd64 stubs and plugins: the official release only ships x86 ones, so build NSIS
+; from source with TARGET_ARCH=amd64. Without it the setup program is 32-bit; the app it
+; installs is 64-bit either way.
 
 Unicode true
 SetCompressor /SOLID lzma
