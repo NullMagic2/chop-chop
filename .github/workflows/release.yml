@@ -19,8 +19,26 @@ permissions:
   contents: write
 
 jobs:
+  check:
+    name: Check for uploaded binaries
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          # A release whose binaries were uploaded by hand (a locally built and tested set)
+          # is left alone instead of being rebuilt and overwritten.
+          n=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets | length' 2>/dev/null || echo 0)
+          echo "skip=$([ "$n" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
   deb:
     name: Ubuntu .deb
+    needs: check
+    if: needs.check.outputs.skip != 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +54,8 @@ jobs:
 
   windows:
     name: Windows installer
+    needs: check
+    if: needs.check.outputs.skip != 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
