@@ -6,7 +6,7 @@
 
 <p align="center">
   Cut a clip out of a video, or split a whole video into parts, fast.<br>
-  Frame-accurate, multicore, with audio export. For Ubuntu and Windows.
+  Frame-accurate, almost lossless, with audio export. For Ubuntu and Windows.
 </p>
 
 <p align="center">
@@ -21,9 +21,9 @@
 Chop Chop Splitter is a small, focused video cutter. Open a video, drag the two handles on the
 timeline (or type exact times), and press **Cut clip**. To split a long recording into
 pieces, switch to **Batch split** and choose "every 5 minutes" or "4 equal parts". Behind
-the scenes the work is split into chunks that [FFmpeg](https://ffmpeg.org) encodes **in
-parallel on every CPU core**. The chunks are then joined without re-encoding, so long cuts
-finish in a fraction of the usual time and stay frame-accurate.
+the scenes [FFmpeg](https://ffmpeg.org) re-encodes only the few frames between each cut and
+the nearest keyframe and copies everything else untouched, so a cut lands exactly on the
+frame you chose, keeps the original quality, and takes about as long as copying the file.
 
 It is written in Rust. On Ubuntu it is a GTK 3 app with Ubuntu's Yaru icons. On Windows it
 is a native Win32 app built with [windows-rs](https://github.com/microsoft/windows-rs). Both
@@ -33,10 +33,10 @@ use the same cutting engine and translations.
 
 - **Two modes**
   - *Custom selection*: cut one clip between a start and an end time.
-  - *Batch split*: cut the whole video into parts, either every N minutes/seconds or into N equal parts. Each part is encoded in parallel.
+  - *Batch split*: cut the whole video into parts, either every N minutes/seconds or into N equal parts. Several parts are cut at once.
 - **Precise start/end**: drag the handles on the timeline, or type `HH:MM:SS.mmm`, `MM:SS` or plain seconds. The selection follows as you type.
 - **Live preview**: a large frame preview of the start or end point that updates as you move, plus a thumbnail of the file.
-- **Frame-accurate, multicore cutting**: the range is split into chunks that are encoded to H.264 at the same time, one FFmpeg per worker. The audio is encoded once and everything is joined losslessly. Chunk boundaries snap to frames, so no frame is duplicated or dropped.
+- **Frame-accurate, almost lossless cutting**: only the frames from each cut to the nearest keyframe inside the range are re-encoded, with the source's own codec (H.264 or HEVC), profile and pixel format. The video between those keyframes and the audio are copied, and the pieces are joined without re-encoding, so no frame is duplicated or dropped. Videos that can't be cut this way (other codecs, open-GOP streams) are re-encoded to H.264 instead, on the GPU when there is one (NVIDIA NVENC, AMD AMF, Intel Quick Sync, or VA-API on Linux).
 - **Export audio** as **WAV, MP3, OGG (Vorbis), FLAC, M4A (AAC) or OPUS**: pick the format in the save dialog. In Batch split you get one audio file per part.
 - **Per-job progress** with an ETA, Cancel (temporary files are cleaned up), overwrite confirmation, an editable file name filled in from the clip range, drag & drop, and Ctrl+O.
 - **Four languages**: English, Português, Español and Ελληνικά. Switch with the flag button; the choice is remembered, and on first launch the system language is used.
@@ -98,6 +98,10 @@ cd windows\installer
 makensis -DVERSION=1.8.0 -DAPPDIR=..\target\release -DFFMPEG=C:\path\to\ffmpeg\bin chop-chop.nsi
 ```
 
+That setup program is 32-bit (the app it installs is 64-bit). For a 64-bit setup program, add
+`-XTarget amd64-unicode` before `chop-chop.nsi`; this needs an NSIS built from source with
+`TARGET_ARCH=amd64`, because the official NSIS release only includes 32-bit stubs.
+
 You can also cross-compile from Linux with `rustup target add x86_64-pc-windows-gnu` and
 `mingw-w64`. Then build with `cargo build --release --target x86_64-pc-windows-gnu` in
 `windows/`.
@@ -113,7 +117,7 @@ publishes both to a GitHub release.
 ```
 src/
   main.rs        GTK 3 user interface (Ubuntu)
-  splitter.rs    FFmpeg engine: probing, thumbnails, parallel chunked encoding (shared)
+  splitter.rs    FFmpeg engine: probing, thumbnails, smart cutting (shared)
   i18n.rs        English / Português / Español / Ελληνικά strings (shared)
 windows/
   src/           Native Win32 user interface (windows-rs)

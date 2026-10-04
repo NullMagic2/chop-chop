@@ -2,7 +2,7 @@
 name = "chop-chop"
 version = "1.8.0"
 edition = "2021"
-description = "Chop Chop Splitter: cut a clip or batch-split a video into parts, with audio export (GTK 3, multicore, Yaru icons)"
+description = "Chop Chop Splitter: cut a clip or batch-split a video into parts, with audio export (GTK 3, Yaru icons)"
 license = "MIT"
 
 [dependencies]
