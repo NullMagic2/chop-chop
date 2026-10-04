@@ -9,7 +9,7 @@ use gtk::prelude::*;
 use gtk::{cairo, gdk, gdk_pixbuf, gio, glib};
 use i18n::{bind, tr, trf, Lang};
 use splitter::{AudioFormat, CutJob, Msg, TaskKind, VideoInfo};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 
 const APP_ID: &str = "io.github.ChopChop";
 const RES: &str = "/io/github/chopchop";
-const PREVIEW_W: i32 = 560;
-const PREVIEW_H: i32 = 315;
+/// Smallest preview frame; it grows with the window, and thumbnails are made at its size.
+const PREVIEW_W: i32 = 400;
+const PREVIEW_H: i32 = 225;
 const MIN_CLIP: f64 = 0.1;
 const TL_PAD: f64 = 14.0;
 
@@ -47,7 +48,11 @@ struct Ui {
     drop_sub: gtk::Label,
     chips: gtk::Box,
     mode_stack: gtk::Stack,
+    /// "No video" icon, shown until the first frame arrives.
     preview: gtk::Image,
+    /// The current frame, drawn scaled to fit the frame box.
+    preview_area: gtk::DrawingArea,
+    preview_pb: Rc<RefCell<Option<gdk_pixbuf::Pixbuf>>>,
     preview_badge: gtk::Label,
     preview_spinner: gtk::Spinner,
     timeline: gtk::DrawingArea,
@@ -144,7 +149,7 @@ fn main() -> glib::ExitCode {
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
-    let initial: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
+    let initial: Option<PathBuf> = std::env::args().nth(1).map(|a| std::path::absolute(&a).unwrap_or_else(|_| PathBuf::from(a)));
     app.connect_activate(move |app| build(app, initial.clone()));
     let argv0: Vec<String> = std::env::args().take(1).collect();
     app.run_with_args(&argv0)
@@ -270,11 +275,19 @@ fn build(app: &gtk::Application, initial: Option<PathBuf>) {
         gtk::StyleContext::add_provider_for_screen(&screen, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
 
+    // The preferred size, but never larger than the screen it opens on (a 1080p laptop at
+    // 150 % scaling has room for about 1280 × 690).
+    let (mut dw, mut dh) = (1200, 840);
+    if let Some(m) = gdk::Display::default().and_then(|d| d.primary_monitor().or_else(|| d.monitor(0))) {
+        let wa = m.workarea();
+        dw = dw.min(wa.width() * 92 / 100);
+        dh = dh.min(wa.height() * 92 / 100);
+    }
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("Chop Chop Splitter")
-        .default_width(1200)
-        .default_height(840)
+        .default_width(dw)
+        .default_height(dh)
         .icon_name(APP_ID)
         .build();
     window.style_context().add_class("vs-window");
@@ -339,7 +352,7 @@ fn build(app: &gtk::Application, initial: Option<PathBuf>) {
     // Two columns: video on the left, export + progress on the right.
     let shell = gtk::Box::new(gtk::Orientation::Horizontal, 18);
     shell.style_context().add_class("vs-root");
-    shell.set_border_width(20);
+    shell.set_border_width(14);
     let left_scroll = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).build();
     let left = gtk::Box::new(gtk::Orientation::Vertical, 16);
     left_scroll.add(&left);
@@ -391,6 +404,25 @@ fn build(app: &gtk::Application, initial: Option<PathBuf>) {
     preview.set_valign(gtk::Align::Center);
     preview.set_halign(gtk::Align::Center);
     frame_box.pack_start(&preview, true, true, 0);
+    // Frames are drawn scaled to the box (an image would make the box as large as the picture).
+    let preview_pb: Rc<RefCell<Option<gdk_pixbuf::Pixbuf>>> = Rc::new(RefCell::new(None));
+    let preview_area = gtk::DrawingArea::new();
+    {
+        let pb = preview_pb.clone();
+        preview_area.connect_draw(move |w, cr| {
+            if let Some(pb) = pb.borrow().as_ref() {
+                let (aw, ah) = (w.allocated_width() as f64, w.allocated_height() as f64);
+                let (pw, ph) = (pb.width() as f64, pb.height() as f64);
+                let k = (aw / pw).min(ah / ph);
+                cr.translate((aw - pw * k) / 2.0, (ah - ph * k) / 2.0);
+                cr.scale(k, k);
+                cr.set_source_pixbuf(pb, 0.0, 0.0);
+                let _ = cr.paint();
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    frame_box.pack_start(&preview_area, true, true, 0);
     overlay.add(&frame_box);
     let preview_badge = gtk::Label::new(Some(&tr("NO VIDEO")));
     preview_badge.style_context().add_class("vs-badge");
@@ -407,7 +439,8 @@ fn build(app: &gtk::Application, initial: Option<PathBuf>) {
     preview_spinner.set_margin_top(14);
     preview_spinner.set_size_request(20, 20);
     overlay.add_overlay(&preview_spinner);
-    pcontent.pack_start(&overlay, false, false, 0);
+    // The preview takes the height the card can spare.
+    pcontent.pack_start(&overlay, true, true, 0);
 
     let timeline = gtk::DrawingArea::new();
     timeline.set_size_request(-1, 70);
@@ -586,7 +619,7 @@ fn build(app: &gtk::Application, initial: Option<PathBuf>) {
     let list_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .min_content_height(100)
+        .min_content_height(40) // it scrolls; small screens need the height
         .vexpand(true)
         .build();
     list_scroll.set_overlay_scrolling(false);
@@ -607,6 +640,8 @@ fn build(app: &gtk::Application, initial: Option<PathBuf>) {
         chips,
         mode_stack,
         preview,
+        preview_area,
+        preview_pb,
         preview_badge,
         preview_spinner,
         timeline,
@@ -655,6 +690,7 @@ fn build(app: &gtk::Application, initial: Option<PathBuf>) {
         }
     }
     window.show_all();
+    ui.preview_area.hide(); // until the first frame arrives
     mode_changed(&ui, &st);
 
     if splitter::ffmpeg_available() {
@@ -677,6 +713,24 @@ fn build(app: &gtk::Application, initial: Option<PathBuf>) {
 // ───────────────────────── signals ─────────────────────────
 
 fn connect_signals(ui: &Rc<Ui>, st: &St, open_btn: &gtk::Button) {
+    // A resized preview frame gets a thumbnail made at its new size.
+    if let Some(frame) = ui.preview.parent() {
+        let (ui, st) = (ui.clone(), st.clone());
+        let last = Rc::new(Cell::new((0, 0)));
+        frame.connect_size_allocate(move |_, a| {
+            let (lw, lh) = last.get();
+            if (a.width() - lw).abs() > 24 || (a.height() - lh).abs() > 24 {
+                last.set((a.width(), a.height()));
+                // Outside the allocation pass, where the state may be borrowed.
+                let (ui, st) = (ui.clone(), st.clone());
+                glib::idle_add_local_once(move || {
+                    if st.borrow().info.is_some() {
+                        request_preview(&ui, &st, 250);
+                    }
+                });
+            }
+        });
+    }
     // Open dialog (button, drop zone, Ctrl+O)
     let pick: Rc<dyn Fn()> = {
         let (ui, st) = (ui.clone(), st.clone());
@@ -1201,7 +1255,10 @@ fn request_preview(ui: &Rc<Ui>, st: &St, delay_ms: u64) {
         ui.preview_spinner.start();
         ui.preview_spinner.show();
         glib::spawn_future_local(async move {
-            let res = gio::spawn_blocking(move || splitter::thumbnail(&path, t, PREVIEW_W as u32, PREVIEW_H as u32)).await;
+            // Made at the frame's current size, so it fills the frame however large it is.
+            let frame = ui.preview.parent().map(|p| (p.allocated_width(), p.allocated_height())).unwrap_or((0, 0));
+            let (w, h) = (frame.0.clamp(PREVIEW_W, 1920) as u32, frame.1.clamp(PREVIEW_H, 1080) as u32);
+            let res = gio::spawn_blocking(move || splitter::thumbnail(&path, t, w, h)).await;
             if st.borrow().preview_gen != gen {
                 return;
             }
@@ -1209,8 +1266,10 @@ fn request_preview(ui: &Rc<Ui>, st: &St, delay_ms: u64) {
             ui.preview_spinner.hide();
             if let Ok(Ok(bytes)) = res {
                 if let Some(pb) = pixbuf_from_png(&bytes) {
-                    ui.preview.set_from_pixbuf(Some(&pb));
-                    ui.preview.set_opacity(1.0);
+                    ui.preview.hide();
+                    ui.preview_pb.replace(Some(pb));
+                    ui.preview_area.show();
+                    ui.preview_area.queue_draw();
                 }
             }
         });
@@ -1369,13 +1428,8 @@ fn pick_audio_target(ui: &Ui, st: &St) -> Option<(AudioFormat, PathBuf)> {
 
 // ───────────────────────── behaviour ─────────────────────────
 
-/// Translate the engine's job titles ("Parallel chunk 1/2", "Part 03 · MP3", "MP3 audio", …).
+/// Translate the engine's job titles ("Clip", "Part 03", "Part 03 · MP3", "MP3 audio", …).
 fn loc_title(t: &str) -> String {
-    if let Some(rest) = t.strip_prefix("Parallel chunk ") {
-        if let Some((i, n)) = rest.split_once('/') {
-            return trf("Parallel chunk {i}/{n}", &[("i", i.to_string()), ("n", n.to_string())]);
-        }
-    }
     if let Some(rest) = t.strip_prefix("Part ") {
         return match rest.split_once(" · ") {
             Some((i, fmt)) => trf("Part {i} · {fmt}", &[("i", i.to_string()), ("fmt", fmt.to_string())]),
@@ -1586,6 +1640,7 @@ fn start(ui: &Rc<Ui>, st: &St, audio: Option<(AudioFormat, PathBuf)>) {
         has_audio: false,
         fps: 0.0,
         tmp_dir: PathBuf::new(),
+        src: info.clone(),
     };
     let files = splitter::outputs(&job_preview);
     if files.iter().any(|p| *p == info.path) {
@@ -1618,9 +1673,8 @@ fn start(ui: &Rc<Ui>, st: &St, audio: Option<(AudioFormat, PathBuf)>) {
     for t in &tasks {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let ic_name = match t.kind {
-            TaskKind::Audio { .. } | TaskKind::AudioExport { .. } => "vs-audio-x-generic-symbolic",
-            TaskKind::Join => "vs-view-grid-symbolic",
-            _ => "vs-video-x-generic-symbolic",
+            TaskKind::AudioExport { .. } => "vs-audio-x-generic-symbolic",
+            TaskKind::Clip { .. } => "vs-video-x-generic-symbolic",
         };
         row.pack_start(&accent_icon(ic_name, 16), false, false, 0);
         let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -1657,13 +1711,9 @@ fn start(ui: &Rc<Ui>, st: &St, audio: Option<(AudioFormat, PathBuf)>) {
     oc.remove_class("failed");
     ui.percent.set_text("0%");
     let workers = job.workers;
-    let chunks = tasks.iter().filter(|t| matches!(t.kind, TaskKind::VideoChunk { .. })).count();
     let w = workers.min(n).to_string();
-    let mut status = match (&audio, mode) {
-        (None, Mode::Custom) => trf(
-            "Encoding {len} — split into {n} chunk(s) so every core helps…",
-            &[("len", splitter::fmt_ts(end_t - start_t)), ("n", chunks.to_string())],
-        ),
+    let status = match (&audio, mode) {
+        (None, Mode::Custom) => trf("Cutting {len}…", &[("len", splitter::fmt_ts(end_t - start_t))]),
         (None, Mode::Batch) => trf("Splitting into {n} parts, {w} at a time…", &[("n", n.to_string()), ("w", w)]),
         (Some((f, _)), Mode::Custom) => trf("Exporting {fmt} audio…", &[("fmt", f.label().to_string())]),
         (Some((f, _)), Mode::Batch) => trf(
@@ -1671,9 +1721,6 @@ fn start(ui: &Rc<Ui>, st: &St, audio: Option<(AudioFormat, PathBuf)>) {
             &[("n", n.to_string()), ("fmt", f.label().to_string()), ("w", w)],
         ),
     };
-    // Which encoder does the work (the GPU's, or libx264 on the CPU), shown while it runs.
-    let encoder_note = if audio.is_none() { format!(" · {}", splitter::video_encoder().label()) } else { String::new() };
-    status.push_str(&encoder_note);
     ui.status.set_text(&status);
     set_running_ui(ui, st, true);
 
@@ -1779,7 +1826,7 @@ fn start(ui: &Rc<Ui>, st: &St, audio: Option<(AudioFormat, PathBuf)>) {
                 "{t} elapsed · about {left} left",
                 &[("t", splitter::fmt_time(elapsed)), ("left", splitter::fmt_time(eta))],
             );
-            ui.status.set_text(&format!("{eta_text}{encoder_note}"));
+            ui.status.set_text(&eta_text);
         }
         glib::ControlFlow::Continue
     });

@@ -1,16 +1,18 @@
-//! FFmpeg-backed cutting engine. All cuts are frame-accurate re-encodes.
+//! FFmpeg-backed cutting engine. Cuts are frame-accurate and almost lossless:
 //!
-//! Video is encoded on the GPU with its maker's encoder — NVIDIA NVENC, AMD AMF or Intel
-//! Quick Sync (VA-API is the Linux fallback for AMD/Intel) — and with libx264 on the CPU
-//! when there is no usable GPU. The GPU is detected once and checked with a short test
-//! encode; it is invisible to the user. If a GPU encode fails later, that piece is redone
-//! on the CPU and the GPU is not used again.
+//! Only the frames between a cut and the nearest keyframe inside the range are re-encoded
+//! (with the source's own codec, profile and pixel format); the video between those
+//! keyframes is copied untouched, the audio is copied, and the pieces are joined without
+//! re-encoding. So a cut takes about as long as copying the file.
 //!
-//! * Custom selection: the range is divided into N chunks that are encoded
-//!   **in parallel** (one FFmpeg per CPU worker), the audio is encoded once,
-//!   and everything is joined losslessly into a single clip.
-//! * Batch split: the video is cut into many part files; the parts themselves
-//!   are encoded in parallel across the workers.
+//! When that isn't possible — a codec other than H.264/HEVC, an open-GOP stream, or a range
+//! with no keyframe inside — the range is re-encoded instead: on the GPU with its maker's
+//! encoder (NVIDIA NVENC, AMD AMF, Intel Quick Sync; VA-API is the Linux fallback for
+//! AMD/Intel), or with libx264 on the CPU when there is no usable GPU. The GPU is detected
+//! once and checked with a short test encode. If a GPU encode fails, that piece is redone on
+//! the CPU and the GPU is not used again.
+//!
+//! In a batch split every part is cut the same way, several parts at a time.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -31,6 +33,13 @@ pub struct VideoInfo {
     pub acodec: String,
     pub size_bytes: u64,
     pub fps: f64,
+    /// Timestamp of the file's first packet; FFmpeg's `-ss` is relative to it.
+    pub start_time: f64,
+    /// Video profile and pixel format, matched when the edges of a smart cut are re-encoded.
+    pub profile: String,
+    pub pix_fmt: String,
+    /// How many frames the decoder may hold back for B-frame reordering.
+    pub has_b_frames: u32,
 }
 
 /// Audio-only export formats.
@@ -97,14 +106,8 @@ impl AudioFormat {
 pub enum TaskKind {
     /// Standalone audio file export of the range.
     AudioExport { format: AudioFormat, start: f64, len: f64, file: PathBuf },
-    /// One complete batch part (video + audio) written straight to its own file.
-    VideoPart { start: f64, len: f64, file: PathBuf },
-    /// Video-only encode of [start, start+len).
-    VideoChunk { start: f64, len: f64, file: PathBuf },
-    /// Audio-only encode of the whole range.
-    Audio { file: PathBuf },
-    /// Concatenate chunks + mux audio into the final file.
-    Join,
+    /// A clip or batch part [start, start+len), cut as described at the top of this file.
+    Clip { start: f64, len: f64, file: PathBuf },
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +134,8 @@ pub struct CutJob {
     pub has_audio: bool,
     pub fps: f64,
     pub tmp_dir: PathBuf,
+    /// The probed source (timestamps and the codec details smart cuts match).
+    pub src: VideoInfo,
 }
 
 #[derive(Debug)]
@@ -181,8 +186,11 @@ pub fn cores() -> usize {
 pub fn probe(path: &Path) -> Result<VideoInfo, String> {
     let out = tool("ffprobe")
         .args(["-v", "error", "-show_entries"])
-        .arg("format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate")
-        .args(["-of", "default=noprint_wrappers=1"])
+        .arg(
+            "format=duration,start_time:stream=codec_type,codec_name,profile,width,height,pix_fmt,has_b_frames,\
+             avg_frame_rate,r_frame_rate:stream_disposition=attached_pic",
+        )
+        .args(["-of", "compact=p=0"])
         .arg(path)
         .output()
         .map_err(|e| format!("Could not run ffprobe: {e}"))?;
@@ -195,33 +203,32 @@ pub fn probe(path: &Path) -> Result<VideoInfo, String> {
         size_bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
         ..Default::default()
     };
-    let (mut name, mut w, mut h) = (String::new(), 0u32, 0u32);
+    let rate = |v: &str| {
+        let (n, d) = v.split_once('/')?;
+        let (n, d): (f64, f64) = (n.parse().ok()?, d.parse().ok()?);
+        (n > 0.0 && d > 0.0).then(|| n / d)
+    };
+    // One line per stream and one for the format, as "key=value|key=value…".
     for line in text.lines() {
-        let Some((k, v)) = line.split_once('=') else { continue };
-        match k {
-            "codec_name" => name = v.to_string(),
-            "width" => w = v.parse().unwrap_or(0),
-            "height" => h = v.parse().unwrap_or(0),
-            "codec_type" if v == "video" && info.vcodec.is_empty() => info.vcodec = name.clone(),
-            "codec_type" if v == "audio" && info.acodec.is_empty() => info.acodec = name.clone(),
-            "avg_frame_rate" if info.fps == 0.0 => {
-                if let Some((n, d)) = v.split_once('/') {
-                    let (n, d): (f64, f64) = (n.parse().unwrap_or(0.0), d.parse().unwrap_or(0.0));
-                    if n > 0.0 && d > 0.0 {
-                        info.fps = n / d;
-                    }
-                }
+        let f: std::collections::HashMap<&str, &str> = line.split('|').filter_map(|kv| kv.split_once('=')).collect();
+        let get = |k: &str| f.get(k).copied().unwrap_or("");
+        match get("codec_type") {
+            // Cover art is stored as a one-frame video stream; it isn't the video.
+            "video" if info.vcodec.is_empty() && get("disposition:attached_pic") != "1" => {
+                info.vcodec = get("codec_name").to_string();
+                info.profile = get("profile").to_string();
+                info.pix_fmt = get("pix_fmt").to_string();
+                info.width = get("width").parse().unwrap_or(0);
+                info.height = get("height").parse().unwrap_or(0);
+                info.has_b_frames = get("has_b_frames").parse().unwrap_or(0);
+                info.fps = rate(get("avg_frame_rate")).or_else(|| rate(get("r_frame_rate"))).unwrap_or(0.0);
             }
-            "duration" => {
-                if let Ok(d) = v.parse::<f64>() {
-                    info.duration = d;
-                }
+            "audio" if info.acodec.is_empty() => info.acodec = get("codec_name").to_string(),
+            "" => {
+                info.duration = get("duration").parse().unwrap_or(0.0);
+                info.start_time = get("start_time").parse().unwrap_or(0.0);
             }
             _ => {}
-        }
-        if k == "height" && info.width == 0 && w > 0 && !info.vcodec.is_empty() {
-            info.width = w;
-            info.height = h;
         }
     }
     if info.vcodec.is_empty() {
@@ -273,16 +280,6 @@ impl VideoEncoder {
         self != VideoEncoder::X264
     }
 
-    pub fn label(self) -> &'static str {
-        match self {
-            VideoEncoder::Nvenc => "NVIDIA NVENC",
-            VideoEncoder::Qsv => "Intel Quick Sync",
-            VideoEncoder::Amf => "AMD AMF",
-            VideoEncoder::Vaapi => "VA-API",
-            VideoEncoder::X264 => "libx264 (CPU)",
-        }
-    }
-
     /// How many encodes the hardware runs at once without hitting session limits
     /// (consumer NVIDIA cards, for example, cap concurrent NVENC sessions).
     pub fn slots(self) -> usize {
@@ -302,6 +299,11 @@ impl VideoEncoder {
             "cpu" | "x264" | "libx264" | "software" => VideoEncoder::X264,
             _ => return None,
         })
+    }
+
+    /// Filter that hands frames to the encoder (VA-API encodes from GPU memory).
+    fn upload_filter(self) -> Option<&'static str> {
+        (self == VideoEncoder::Vaapi).then_some("format=nv12,hwupload")
     }
 
     /// Options that must come before `-i` (VA-API needs its device).
@@ -324,7 +326,7 @@ impl VideoEncoder {
                 "-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", "20", "-qp_p", "22", "-qp_b", "24",
                 "-pix_fmt", "nv12",
             ],
-            VideoEncoder::Vaapi => &["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-qp", "21"],
+            VideoEncoder::Vaapi => &["-c:v", "h264_vaapi", "-qp", "21"],
             VideoEncoder::X264 => &["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p"],
         };
         let mut v: Vec<String> = a.iter().map(|s| s.to_string()).collect();
@@ -364,11 +366,13 @@ impl GpuVendor {
 
     /// The maker's own encoder: NVIDIA → NVENC, AMD → AMF, Intel → Quick Sync. On Linux,
     /// where AMF and Quick Sync often aren't available, AMD and Intel can also use VA-API.
+    /// For AMD on Linux VA-API comes first: AMF there sets up a Vulkan device in every FFmpeg
+    /// process, which made it about half as fast as VA-API on the same GPU (RX 7900 XT).
     fn encoders(self) -> &'static [VideoEncoder] {
         match self {
             GpuVendor::Nvidia => &[VideoEncoder::Nvenc],
             GpuVendor::Amd if cfg!(windows) => &[VideoEncoder::Amf],
-            GpuVendor::Amd => &[VideoEncoder::Amf, VideoEncoder::Vaapi],
+            GpuVendor::Amd => &[VideoEncoder::Vaapi, VideoEncoder::Amf],
             GpuVendor::Intel if cfg!(windows) => &[VideoEncoder::Qsv],
             GpuVendor::Intel => &[VideoEncoder::Qsv, VideoEncoder::Vaapi],
         }
@@ -443,6 +447,7 @@ fn encoder_works(enc: VideoEncoder) -> bool {
     c.args(["-hide_banner", "-nostdin", "-loglevel", "error"])
         .args(enc.input_args())
         .args(["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30", "-frames:v", "10"])
+        .args(enc.upload_filter().map(|f| vec!["-vf", f]).unwrap_or_default())
         .args(enc.output_args(1))
         .args(["-f", "null", "-"])
         .stdin(Stdio::null())
@@ -496,69 +501,93 @@ impl Slots {
     }
 }
 
+/// How far around a cut to look for keyframes, in seconds.
+const KF_WINDOW: f64 = 60.0;
+
+/// Seeking in some containers is imprecise (MPEG-TS can land after the target, Matroska well
+/// before it), so every seek starts this many seconds early and the exact position is chosen
+/// by timestamp afterwards.
+const PREROLL: f64 = 5.0;
+
+/// A video packet: presentation time (relative to the file start, like `-ss`), keyframe flag,
+/// and decode time when the container stores it.
+type Packet = (f64, bool, Option<f64>);
+
+/// Video packets in decode order inside the given windows. Only those windows are read,
+/// without decoding.
+fn decode_order(src: &VideoInfo, windows: &[(f64, f64)]) -> Vec<Packet> {
+    if windows.is_empty() {
+        return Vec::new();
+    }
+    let st = src.start_time;
+    let intervals: Vec<String> =
+        windows.iter().map(|(a, b)| format!("{:.6}%{:.6}", (a - PREROLL).max(0.0) + st, b + st)).collect();
+    let Ok(out) = tool("ffprobe")
+        .args(["-v", "error", "-select_streams", "V:0", "-read_intervals"])
+        .arg(intervals.join(","))
+        .args(["-show_entries", "packet=pts_time,dts_time,flags", "-of", "csv=p=0"])
+        .arg(&src.path)
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split(',');
+            let t: f64 = it.next()?.trim().parse().ok()?;
+            let dts = it.next().and_then(|d| d.trim().parse::<f64>().ok()).map(|d| d - st);
+            Some((t - st, it.next().unwrap_or("").contains('K'), dts))
+        })
+        .collect()
+}
+
+/// The packets sorted by presentation time: (time, keyframe).
+fn packets(src: &VideoInfo, windows: &[(f64, f64)]) -> Vec<(f64, bool)> {
+    let mut v: Vec<(f64, bool)> = decode_order(src, windows).into_iter().map(|p| (p.0, p.1)).collect();
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    v.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-6);
+    v
+}
+
+/// Open GOP: frames decoded after a keyframe but shown before it, which depend on the
+/// previous GOP. Such a stream can't be copied from a keyframe without losing those frames.
+fn open_gop(order: &[Packet]) -> bool {
+    let mut key: Option<f64> = None;
+    order.iter().any(|(t, k, _)| {
+        if *k {
+            key = Some(*t);
+            false
+        } else {
+            key.is_some_and(|kt| *t < kt - 1e-6)
+        }
+    })
+}
+
+/// Time of the first frame shown at or after `t`.
+fn first_frame_at(src: &VideoInfo, t: f64) -> Option<f64> {
+    packets(src, &[(t, t + 5.0)]).into_iter().map(|p| p.0).find(|p| *p >= t - 1e-6)
+}
+
 /// Decide how the job will be executed (also used by the UI to draw the task list).
 pub fn plan_tasks(job: &CutJob) -> Vec<Task> {
-    let len = (job.end - job.start).max(0.0);
-    let mut tasks = Vec::new();
-    if job.output.is_some() {
-        {
-            // One chunk per worker, but never chunks shorter than ~2 s. A GPU runs only a
-            // few encodes at once, so there are no more chunks than it has slots.
-            let n = job.workers.max(1).min(video_encoder().slots()).min(((len / 2.0).floor() as usize).max(1));
-            let chunk = len / n as f64;
-            // Chunk boundaries are snapped to whole frames so no frame is duplicated or lost.
-            let snap = |t: f64| if job.fps > 0.0 { (t * job.fps).round() / job.fps } else { t };
-            let bound = |i: usize| if i == 0 { job.start } else if i == n { job.end } else { snap(job.start + i as f64 * chunk) };
-            tasks.extend((0..n)
-                .map(|i| {
-                    let s = bound(i);
-                    let l = bound(i + 1) - s;
-                    Task {
-                        title: format!("Parallel chunk {}/{}", i + 1, n),
-                        detail: format!("{} → {}", fmt_ts(s), fmt_ts(s + l)),
-                        kind: TaskKind::VideoChunk { start: s, len: l, file: job.tmp_dir.join(format!("chunk{:03}.mp4", i)) },
-                        weight: l,
-                    }
-                }));
-            if job.has_audio {
-                tasks.push(Task {
-                    title: "Audio track".into(),
-                    detail: "AAC 192 kb/s".into(),
-                    kind: TaskKind::Audio { file: job.tmp_dir.join("audio.m4a") },
-                    weight: len * 0.08,
-                });
-            }
-            tasks.push(Task {
-                title: "Join".into(),
-                detail: "Lossless concat + mux".into(),
-                kind: TaskKind::Join,
-                weight: len * 0.04,
-            });
-        }
-    }
-    // Audio exports run in the same worker pool, in parallel with the video chunks.
-    // They go before the Join so that Join stays last in the list.
-    let join_pos = tasks.iter().position(|t| matches!(t.kind, TaskKind::Join)).unwrap_or(tasks.len());
+    let clip = |title: String, start: f64, len: f64, file: PathBuf| Task {
+        title,
+        detail: format!("{} → {}", fmt_ts(start), fmt_ts(start + len)),
+        kind: TaskKind::Clip { start, len, file },
+        weight: len,
+    };
+    let mut tasks: Vec<Task> = job.output.iter().map(|out| clip("Clip".into(), job.start, (job.end - job.start).max(0.0), out.clone())).collect();
     let digits = job.parts.len().max(job.audio_exports.len()).to_string().len().max(2);
-    let mut extra: Vec<Task> = job
-        .parts
-        .iter()
-        .enumerate()
-        .map(|(i, (s, l, file))| Task {
-            title: format!("Part {:0digits$}", i + 1),
-            detail: format!("{} → {}", fmt_ts(*s), fmt_ts(s + l)),
-            kind: TaskKind::VideoPart { start: *s, len: *l, file: file.clone() },
-            weight: *l,
-        })
-        .collect();
+    tasks.extend(job.parts.iter().enumerate().map(|(i, (s, l, file))| clip(format!("Part {:0digits$}", i + 1), *s, *l, file.clone())));
+    // Audio exports run in the same worker pool, in parallel with the video.
     let many = job.audio_exports.len() > 1;
-    extra.extend(job.audio_exports.iter().enumerate().map(|(i, (format, s, l, file))| Task {
+    tasks.extend(job.audio_exports.iter().enumerate().map(|(i, (format, s, l, file))| Task {
         title: if many { format!("Part {:0digits$} · {}", i + 1, format.label()) } else { format!("{} audio", format.label()) },
         detail: if many { format!("{} → {}", fmt_ts(*s), fmt_ts(s + l)) } else { format.describe().into() },
         kind: TaskKind::AudioExport { format: *format, start: *s, len: *l, file: file.clone() },
         weight: l * 0.1,
     }));
-    tasks.splice(join_pos..join_pos, extra);
     tasks
 }
 
@@ -596,28 +625,15 @@ pub fn outputs(job: &CutJob) -> Vec<PathBuf> {
 /// Execute the job on background threads; progress is reported through `tx`.
 pub fn run(job: CutJob, tasks: Vec<Task>, tx: Sender<Msg>, cancel: Arc<AtomicBool>) {
     thread::spawn(move || {
-        let parallel: Vec<usize> = tasks
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| !matches!(t.kind, TaskKind::Join))
-            .map(|(i, _)| i)
-            .collect();
-        let video_jobs = tasks
-            .iter()
-            .filter(|t| matches!(t.kind, TaskKind::VideoChunk { .. } | TaskKind::VideoPart { .. }))
-            .count()
-            .max(1);
+        let video_jobs = tasks.iter().filter(|t| matches!(t.kind, TaskKind::Clip { .. })).count().max(1);
         let threads_per_job = (cores() / video_jobs.min(job.workers.max(1))).max(1);
         let encoder = video_encoder();
-        let ctx = Arc::new(Ctx {
-            encoder,
-            slots: Slots::new(encoder.slots()),
-            used: Mutex::new(vec![None; tasks.len()]),
-        });
+        let ctx = Arc::new(Ctx { encoder, slots: Slots::new(encoder.slots()) });
+        let outputs = outputs(&job);
         let _ = std::fs::create_dir_all(&job.tmp_dir);
 
-        // ---- parallel phase: worker pool pulls tasks from a shared queue ----
-        let queue = Arc::new(Mutex::new(parallel.into_iter().collect::<VecDeque<_>>()));
+        // Worker pool pulls tasks from a shared queue.
+        let queue = Arc::new(Mutex::new((0..tasks.len()).collect::<VecDeque<_>>()));
         let failed = Arc::new(AtomicBool::new(false));
         let first_err = Arc::new(Mutex::new(None::<String>));
         let tasks = Arc::new(tasks);
@@ -647,26 +663,15 @@ pub fn run(job: CutJob, tasks: Vec<Task>, tx: Sender<Msg>, cancel: Arc<AtomicBoo
             let _ = h.join();
         }
 
-        // ---- join phase ----
         let cancelled = cancel.load(Ordering::Relaxed);
-        let mut result: Result<Vec<PathBuf>, String> = match first_err.lock().unwrap().take() {
+        let result: Result<Vec<PathBuf>, String> = match first_err.lock().unwrap().take() {
             Some(e) => Err(e),
             None if cancelled => Err("Cancelled".into()),
-            None => Ok(outputs(&job)),
+            None => Ok(outputs.clone()),
         };
-        if result.is_ok() {
-            if let Some(j) = tasks.iter().position(|t| matches!(t.kind, TaskKind::Join)) {
-                let _ = tx.send(Msg::Started(j));
-                let r = join(&job, &tasks, &ctx);
-                if let Err(e) = &r {
-                    result = Err(e.clone());
-                }
-                let _ = tx.send(Msg::Finished(j, r));
-            }
-        }
         let _ = std::fs::remove_dir_all(&job.tmp_dir);
         if result.is_err() {
-            for f in outputs(&job) {
+            for f in outputs {
                 let _ = std::fs::remove_file(f);
             }
         }
@@ -686,79 +691,374 @@ struct Ctx {
     encoder: VideoEncoder,
     /// GPU encodes allowed at once.
     slots: Slots,
-    /// Which encoder actually produced each video task (indexed like `tasks`).
-    used: Mutex<Vec<Option<VideoEncoder>>>,
 }
 
-/// FFmpeg command for a video chunk or part encoded with `enc`.
-fn video_cmd(job: &CutJob, kind: &TaskKind, enc: VideoEncoder, threads: usize) -> (Command, f64) {
+/// A time on the source's own clock, which `trim` sees when timestamps are kept (`-copyts`).
+fn src_clock(job: &CutJob, t: f64) -> String {
+    format!("{:.6}", t + job.src.start_time)
+}
+
+/// Input options that decode exactly the frames shown in [start, end): seek early, keep the
+/// source timestamps, turn off FFmpeg's own trimming after the seek, and let `trim` choose.
+/// A frame exactly on a boundary belongs to the piece that starts there, so adjacent pieces
+/// never share or lose a frame.
+fn exact_input(c: &mut Command, job: &CutJob, start: f64) {
+    c.args(["-copyts", "-noaccurate_seek"]);
+    if start - PREROLL > 0.0 {
+        c.args(["-ss", &format!("{:.6}", start - PREROLL)]);
+    }
+    c.arg("-i").arg(&job.input);
+}
+
+fn video_trim(job: &CutJob, start: f64, end: f64) -> String {
+    format!("trim=start={}:end={},setpts=PTS-STARTPTS", src_clock(job, start), src_clock(job, end))
+}
+
+fn audio_trim(job: &CutJob, start: f64, end: f64) -> String {
+    format!("atrim=start={}:end={},asetpts=PTS-STARTPTS", src_clock(job, start), src_clock(job, end))
+}
+
+/// FFmpeg command that re-encodes [start, start+len) with `enc` into a finished file.
+fn reencode_cmd(job: &CutJob, start: f64, len: f64, file: &Path, enc: VideoEncoder, threads: usize) -> Command {
     let mut c = base_cmd();
     c.args(enc.input_args());
-    match kind {
-        TaskKind::VideoChunk { start, len, file } => {
-            // Boundaries sit exactly on frame times; flooring to the millisecond keeps the
-            // seek inside (previous frame, this frame], and an exact frame count avoids overlap.
-            c.args(["-ss", &format!("{:.3}", (start * 1000.0).floor() / 1000.0)])
-                .arg("-i")
-                .arg(&job.input);
-            if job.fps > 0.0 {
-                c.args(["-frames:v", &((len * job.fps).round().max(1.0) as u64).to_string()]);
-            } else {
-                c.args(["-t", &format!("{:.3}", len)]);
-            }
-            c.args(["-map", "0:v:0", "-an", "-sn", "-dn"]).args(enc.output_args(threads)).arg(file);
-            (c, *len)
+    exact_input(&mut c, job, start);
+    let mut vf = video_trim(job, start, start + len);
+    if let Some(f) = enc.upload_filter() {
+        vf = format!("{vf},{f}");
+    }
+    c.args(["-map", "0:V:0", "-sn", "-dn", "-vf", &vf, "-fps_mode", "passthrough"]);
+    c.args(enc.output_args(threads));
+    if job.has_audio {
+        // The audio starts with the first frame.
+        let a0 = first_frame_at(&job.src, start).unwrap_or(start);
+        c.args(["-map", "0:a:0", "-af", &audio_trim(job, a0, start + len)])
+            .args(["-c:a", "aac", "-b:a", "192k"]);
+    } else {
+        c.arg("-an");
+    }
+    c.args(["-movflags", "+faststart"]).arg(file);
+    c
+}
+
+/// Re-encode a whole clip: on the GPU first (a few at a time); on failure redo it on the CPU
+/// and stop using the GPU for the rest of the session.
+#[allow(clippy::too_many_arguments)]
+fn reencode(
+    job: &CutJob,
+    start: f64,
+    len: f64,
+    file: &Path,
+    idx: usize,
+    threads: usize,
+    ctx: &Ctx,
+    tx: &Sender<Msg>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let _ = tx.send(Msg::Progress(idx, 0.0));
+    if ctx.encoder.is_hardware() && !HW_BROKEN.load(Ordering::Relaxed) {
+        if !ctx.slots.acquire(cancel) {
+            return Err("Cancelled".into());
         }
-        TaskKind::VideoPart { start, len, file } => {
-            c.args(["-ss", &format!("{:.3}", (start * 1000.0).floor() / 1000.0)])
-                .arg("-i")
-                .arg(&job.input)
-                .args(["-t", &format!("{:.3}", len)]);
-            if job.fps > 0.0 {
-                c.args(["-frames:v", &((len * job.fps).round().max(1.0) as u64).to_string()]);
+        let res = run_ffmpeg(&mut reencode_cmd(job, start, len, file, ctx.encoder, threads), len, idx, tx, cancel, (0.0, 1.0));
+        ctx.slots.release();
+        match res {
+            Ok(()) => return Ok(()),
+            Err(e) if cancel.load(Ordering::Relaxed) => return Err(e),
+            Err(_) => {
+                HW_BROKEN.store(true, Ordering::Relaxed);
+                let _ = tx.send(Msg::Progress(idx, 0.0));
             }
-            c.args(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"])
-                .args(enc.output_args(threads))
-                .args(["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"])
-                .arg(file);
-            (c, *len)
         }
-        _ => unreachable!("video_cmd for a non-video task"),
+    }
+    run_ffmpeg(&mut reencode_cmd(job, start, len, file, VideoEncoder::X264, threads.max(1)), len, idx, tx, cancel, (0.0, 1.0))
+}
+
+/// FFmpeg muxer name for an output file extension.
+fn muxer(path: &Path) -> &'static str {
+    match path.extension().map(|e| e.to_string_lossy().to_lowercase()).as_deref() {
+        Some("mov") => "mov",
+        Some("webm") => "webm",
+        Some("mkv") => "matroska",
+        Some("ts") => "mpegts",
+        _ => "mp4",
+    }
+}
+
+/// Copy the video from the keyframe at `start` up to (not including) the keyframe at `end`,
+/// without re-encoding.
+///
+/// The input seek starts well before the keyframe (seeking isn't exact in every container).
+/// With stream copy, an output `-ss` makes FFmpeg start at the first keyframe whose *decode*
+/// time is at or after it, so it is set just below the keyframe's decode time. The video then
+/// stops after exactly the packets that come before the end keyframe in decode order.
+#[allow(clippy::too_many_arguments)]
+fn copy_range(
+    job: &CutJob,
+    start: f64,
+    end: f64,
+    dest: &Path,
+    idx: usize,
+    tx: &Sender<Msg>,
+    cancel: &AtomicBool,
+    span: (f64, f64),
+) -> Result<(), String> {
+    const COPY_PREROLL: f64 = 10.0;
+    let frame = 1.0 / if job.fps > 0.0 { job.fps } else { 30.0 };
+    let order = decode_order(&job.src, &[(start - 1.0, end + 1.0)]);
+    // The copy must begin above the previous keyframe's presentation time (so that one is
+    // skipped) and below this keyframe's decode time, which trails its presentation time by
+    // the reorder delay. Containers like Matroska don't store every decode time; then it is
+    // worked out from the next packet that has one (decode times advance a frame per packet).
+    let prev_key = order.iter().filter(|(p, k, _)| *k && *p < start - 1e-3).map(|p| p.0).fold(f64::MIN, f64::max);
+    let key_dts = order.iter().position(|(p, k, _)| *k && (p - start).abs() < 1e-3).and_then(|i| {
+        order[i..].iter().enumerate().take(32).find_map(|(n, p)| p.2.map(|d| d - n as f64 * frame))
+    });
+    let key_dts = key_dts.unwrap_or(start - (job.src.has_b_frames as f64 + 1.0) * frame).min(start);
+    let from = (key_dts - frame / 2.0).max(prev_key + 0.0005);
+    let mut c = base_cmd();
+    let pre = (start - COPY_PREROLL).max(0.0);
+    if pre > 0.0 {
+        c.args(["-ss", &format!("{:.6}", pre)]);
+    }
+    c.arg("-i").arg(&job.input);
+    if from - pre > 0.0 {
+        c.args(["-ss", &format!("{:.6}", from - pre)]);
+    }
+    let at = |t: f64| order.iter().position(|(p, k, _)| *k && (p - t).abs() < 1e-3);
+    let (Some(i1), Some(i2)) = (at(start), at(end)) else {
+        return Err(format!("No keyframe at {} or {}", fmt_ts(start), fmt_ts(end)));
+    };
+    c.args(["-frames:v", &(i2 - i1).to_string(), "-map", "0:V:0", "-an", "-sn", "-dn", "-c", "copy"])
+        .args(["-avoid_negative_ts", "make_zero", "-f", muxer(dest)])
+        .arg(dest);
+    run_ffmpeg(&mut c, end - start, idx, tx, cancel, span)
+}
+
+/// Encoder options for re-encoding the edges of a smart cut so they fit the copied middle:
+/// same codec, profile and pixel format. None if smart cuts can't handle this codec.
+fn edge_encoder(src: &VideoInfo) -> Option<Vec<String>> {
+    let pix = if src.pix_fmt.is_empty() { "yuv420p" } else { src.pix_fmt.as_str() };
+    let args: Vec<&str> = match src.vcodec.as_str() {
+        "h264" => {
+            let profile = match src.profile.to_lowercase().as_str() {
+                "high" => "high",
+                "main" => "main",
+                "baseline" | "constrained baseline" => "baseline",
+                "high 10" => "high10",
+                "high 4:2:2" => "high422",
+                "high 4:4:4 predictive" => "high444",
+                _ => return None,
+            };
+            vec!["-c:v", "libx264", "-preset", "medium", "-crf", "16", "-profile:v", profile, "-pix_fmt", pix]
+        }
+        "hevc" => {
+            let profile = match src.profile.to_lowercase().as_str() {
+                "main" => "main",
+                "main 10" => "main10",
+                _ => return None,
+            };
+            vec!["-c:v", "libx265", "-preset", "fast", "-crf", "18", "-profile:v", profile, "-pix_fmt", pix, "-x265-params", "log-level=error"]
+        }
+        _ => return None,
+    };
+    Some(args.into_iter().map(String::from).collect())
+}
+
+/// Presentation span of an MPEG-TS piece (first frame to the end of the last one).
+fn ts_span(path: &Path, frame: f64) -> Option<f64> {
+    let out = tool("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .ok()?;
+    let pts: Vec<f64> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().trim_end_matches(',').parse().ok())
+        .collect();
+    let (lo, hi) = pts.iter().fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(*p), b.max(*p)));
+    (!pts.is_empty()).then(|| hi - lo + frame)
+}
+
+/// Frame-accurate cut of [start, start+len) that re-encodes only the frames before the first
+/// keyframe in the range and after the last one; the video between them is copied. If that
+/// isn't possible (codec, no keyframe inside the range) or fails, the part is re-encoded.
+#[allow(clippy::too_many_arguments)]
+fn smart_part(
+    job: &CutJob,
+    start: f64,
+    len: f64,
+    file: &Path,
+    idx: usize,
+    threads: usize,
+    ctx: &Ctx,
+    tx: &Sender<Msg>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let end = start + len;
+    let frame = 1.0 / if job.fps > 0.0 { job.fps } else { 30.0 };
+    let order = decode_order(&job.src, &[(start, start + KF_WINDOW), ((end - KF_WINDOW).max(start), end + 0.001)]);
+    let mut ks: Vec<f64> = order.iter().filter(|p| p.1).map(|p| p.0).collect();
+    ks.sort_by(f64::total_cmp);
+    let k1 = ks.iter().copied().find(|k| *k >= start - 1e-4);
+    let k2 = ks.iter().copied().rev().find(|k| *k <= end + 1e-4);
+    // Open-GOP frames after the copied keyframes would refer to re-encoded ones; re-encode instead.
+    let plan = match (edge_encoder(&job.src), k1, k2) {
+        (Some(enc), Some(a), Some(b)) if b > a + frame / 2.0 && !open_gop(&order) => Some((enc, a, b)),
+        _ => None,
+    };
+    let Some((enc, k1, k2)) = plan else { return reencode(job, start, len, file, idx, threads, ctx, tx, cancel) };
+    match smart_pieces(job, start, end, k1, k2, &enc, frame, file, idx, tx, cancel) {
+        Err(e) if cancel.load(Ordering::Relaxed) => Err(e),
+        Err(_) => reencode(job, start, len, file, idx, threads, ctx, tx, cancel),
+        Ok(()) => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn smart_pieces(
+    job: &CutJob,
+    start: f64,
+    end: f64,
+    k1: f64,
+    k2: f64,
+    enc: &[String],
+    frame: f64,
+    file: &Path,
+    idx: usize,
+    tx: &Sender<Msg>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let dir = job.tmp_dir.join(format!("smart{idx:03}"));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let first = first_frame_at(&job.src, start).unwrap_or(k1);
+    let (head, mid, tail, audio) = (dir.join("head.ts"), dir.join("mid.ts"), dir.join("tail.ts"), dir.join("audio.m4a"));
+    let has_head = first < k1 - 1e-4;
+    let has_tail = end - k2 > 1e-4;
+
+    // Head: from the first frame up to the first keyframe. Its decode timestamps are moved
+    // back by the source's reorder delay so they stay below those of the copied keyframe.
+    let head_step = |q: &Sender<Msg>| {
+        let shift = (job.src.has_b_frames as f64 + 1.0) * frame;
+        let mut c = base_cmd();
+        exact_input(&mut c, job, start);
+        c.args(["-map", "0:V:0", "-an", "-sn", "-dn", "-vf", &video_trim(job, start, k1 - 0.0005), "-fps_mode", "passthrough"])
+            .args(enc)
+            .args(["-bsf:v", &format!("setts=pts=PTS:dts=DTS-round({shift:.6}/TB)"), "-f", "mpegts"])
+            .arg(&head);
+        run_ffmpeg(&mut c, k1 - start, idx, q, cancel, (0.0, 1.0))
+    };
+    // Middle: copied as is.
+    let mid_step = |q: &Sender<Msg>| copy_range(job, k1, k2, &mid, idx, q, cancel, (0.0, 1.0));
+    // Tail: from the last keyframe to the end, without B-frames, so its timestamps follow on.
+    let tail_step = |q: &Sender<Msg>| {
+        let mut c = base_cmd();
+        exact_input(&mut c, job, k2 - 0.0005);
+        c.args(["-map", "0:V:0", "-an", "-sn", "-dn", "-vf", &video_trim(job, k2 - 0.0005, end), "-fps_mode", "passthrough"])
+            .args(enc)
+            .args(["-bf", "0", "-f", "mpegts"])
+            .arg(&tail);
+        run_ffmpeg(&mut c, end - k2, idx, q, cancel, (0.0, 1.0))
+    };
+    // Audio that MP4 can hold is copied: lossless and instant, and it starts within half an
+    // audio packet (about ±10 ms) of the first frame. Anything else is encoded to AAC.
+    let audio_step = |q: &Sender<Msg>| {
+        let mut c = base_cmd();
+        if matches!(job.src.acodec.as_str(), "aac" | "mp3" | "ac3" | "eac3" | "opus" | "flac" | "alac") {
+            let pre = (first - PREROLL).max(0.0);
+            if pre > 0.0 {
+                c.args(["-ss", &format!("{:.6}", pre)]);
+            }
+            c.arg("-i").arg(&job.input);
+            let from = first - pre - 0.0107;
+            if from > 0.0 {
+                c.args(["-ss", &format!("{:.6}", from)]);
+            }
+            c.args(["-t", &format!("{:.6}", end - first), "-map", "0:a:0", "-vn", "-sn", "-dn", "-c:a", "copy"]);
+        } else {
+            exact_input(&mut c, job, first);
+            c.args(["-map", "0:a:0", "-vn", "-sn", "-dn", "-af", &audio_trim(job, first, end), "-c:a", "aac", "-b:a", "192k"]);
+        }
+        // An MP4 holds the audio until the join. Recent FFmpeg versions treat the first AAC
+        // packet in Matroska as encoder priming, which moved the audio 21 ms early.
+        c.args(["-f", "mp4"]).arg(&audio);
+        run_ffmpeg(&mut c, end - first, idx, q, cancel, (0.0, 1.0))
+    };
+
+    // The four pieces don't depend on each other, so they run at the same time; the task's
+    // progress moves on as each one finishes.
+    let mut steps: Vec<&(dyn Fn(&Sender<Msg>) -> Result<(), String> + Sync)> = vec![&mid_step];
+    if has_head {
+        steps.push(&head_step);
+    }
+    if has_tail {
+        steps.push(&tail_step);
+    }
+    if job.has_audio {
+        steps.push(&audio_step);
+    }
+    let total = steps.len() as f64 + 1.0;
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<Result<(), String>> = thread::scope(|scope| {
+        let handles: Vec<_> = steps
+            .iter()
+            .map(|step| {
+                let done = &done;
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    let (quiet, _) = std::sync::mpsc::channel();
+                    let r = step(&quiet);
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = tx.send(Msg::Progress(idx, n as f64 / total));
+                    r
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("smart cut step panicked".into()))).collect()
+    });
+    results.into_iter().collect::<Result<Vec<()>, String>>()?;
+
+    // (piece, duration to the next piece)
+    let mut pieces: Vec<(PathBuf, Option<f64>)> = Vec::new();
+    if has_head {
+        let span = ts_span(&head, frame).ok_or("smart cut: empty head")?;
+        pieces.push((head, Some(span)));
+    }
+    pieces.push((mid, Some(k2 - k1)));
+    if has_tail {
+        pieces.push((tail, None));
+    }
+
+    let list = dir.join("list.txt");
+    let mut f = std::fs::File::create(&list).map_err(|e| e.to_string())?;
+    for (p, d) in &pieces {
+        let name = concat_path(p);
+        writeln!(f, "file '{name}'").map_err(|e| e.to_string())?;
+        if let Some(d) = d {
+            writeln!(f, "duration {d:.6}").map_err(|e| e.to_string())?;
+        }
+    }
+    drop(f);
+    let mut c = tool("ffmpeg");
+    c.args(["-hide_banner", "-nostdin", "-y", "-loglevel", "error"])
+        .args(["-f", "concat", "-safe", "0", "-i"])
+        .arg(&list);
+    if job.has_audio {
+        c.arg("-i").arg(&audio).args(["-map", "0:v:0", "-map", "1:a:0"]);
+    }
+    c.args(["-c", "copy", "-movflags", "+faststart"]).arg(file);
+    let out = c.output().map_err(|e| e.to_string())?;
+    let _ = tx.send(Msg::Progress(idx, 1.0));
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("join failed").to_string())
     }
 }
 
 fn run_task(job: &CutJob, task: &Task, idx: usize, threads: usize, ctx: &Ctx, tx: &Sender<Msg>, cancel: &AtomicBool) -> Result<(), String> {
-    let len = job.end - job.start;
-    let (mut cmd, dur) = match &task.kind {
-        TaskKind::VideoChunk { .. } | TaskKind::VideoPart { .. } => {
-            // GPU first (a few at a time); on failure redo this piece on the CPU and stop
-            // using the GPU for the rest of the session.
-            if ctx.encoder.is_hardware() && !HW_BROKEN.load(Ordering::Relaxed) {
-                if !ctx.slots.acquire(cancel) {
-                    return Err("Cancelled".into());
-                }
-                let (mut c, d) = video_cmd(job, &task.kind, ctx.encoder, threads);
-                let res = run_ffmpeg(&mut c, d, idx, tx, cancel);
-                ctx.slots.release();
-                match res {
-                    Ok(()) => {
-                        ctx.used.lock().unwrap()[idx] = Some(ctx.encoder);
-                        return Ok(());
-                    }
-                    Err(e) if cancel.load(Ordering::Relaxed) => return Err(e),
-                    Err(_) => {
-                        HW_BROKEN.store(true, Ordering::Relaxed);
-                        let _ = tx.send(Msg::Progress(idx, 0.0));
-                    }
-                }
-            }
-            let (mut c, d) = video_cmd(job, &task.kind, VideoEncoder::X264, threads.max(1));
-            let res = run_ffmpeg(&mut c, d, idx, tx, cancel);
-            if res.is_ok() {
-                ctx.used.lock().unwrap()[idx] = Some(VideoEncoder::X264);
-            }
-            return res;
-        }
+    match &task.kind {
+        TaskKind::Clip { start, len, file } => smart_part(job, *start, *len, file, idx, threads, ctx, tx, cancel),
         TaskKind::AudioExport { format, start, len, file } => {
             let mut c = base_cmd();
             c.args(["-ss", &format!("{:.3}", start)])
@@ -768,66 +1068,19 @@ fn run_task(job: &CutJob, task: &Task, idx: usize, threads: usize, ctx: &Ctx, tx
                 .args(["-map", "0:a:0", "-vn", "-sn", "-dn", "-map_metadata", "0"])
                 .args(format.codec_args())
                 .arg(file);
-            (c, *len)
+            run_ffmpeg(&mut c, *len, idx, tx, cancel, (0.0, 1.0))
         }
-        TaskKind::Audio { file } => {
-            let mut c = base_cmd();
-            c.args(["-ss", &format!("{:.3}", job.start)])
-                .arg("-i")
-                .arg(&job.input)
-                .args(["-t", &format!("{:.3}", len)])
-                .args(["-map", "0:a:0", "-vn", "-c:a", "aac", "-b:a", "192k"])
-                .arg(file);
-            (c, len)
-        }
-        TaskKind::Join => unreachable!(),
-    };
-    run_ffmpeg(&mut cmd, dur, idx, tx, cancel)
-}
-
-fn join(job: &CutJob, tasks: &[Task], ctx: &Ctx) -> Result<(), String> {
-    let list = job.tmp_dir.join("list.txt");
-    let mut f = std::fs::File::create(&list).map_err(|e| e.to_string())?;
-    for t in tasks {
-        if let TaskKind::VideoChunk { file, .. } = &t.kind {
-            let p = file.to_string_lossy().replace('\'', "'\\''");
-            writeln!(f, "file '{p}'").map_err(|e| e.to_string())?;
-        }
-    }
-    drop(f);
-    // Chunks from one encoder are joined losslessly. If the GPU failed half-way and some
-    // chunks came from the CPU instead, their streams differ, so the video is re-encoded.
-    let used = ctx.used.lock().unwrap();
-    let mut encoders = tasks.iter().enumerate().filter(|(_, t)| matches!(t.kind, TaskKind::VideoChunk { .. })).map(|(i, _)| used[i]);
-    let first = encoders.next().flatten();
-    let mixed = encoders.any(|e| e != first);
-    drop(used);
-    let mut c = tool("ffmpeg");
-    c.args(["-hide_banner", "-nostdin", "-y", "-loglevel", "error"])
-        .args(["-f", "concat", "-safe", "0", "-i"])
-        .arg(&list);
-    let audio = tasks.iter().find_map(|t| match &t.kind {
-        TaskKind::Audio { file } => Some(file.clone()),
-        _ => None,
-    });
-    if let Some(a) = &audio {
-        c.arg("-i").arg(a).args(["-map", "0:v:0", "-map", "1:a:0"]);
-    }
-    if mixed {
-        c.args(VideoEncoder::X264.output_args(cores())).args(["-c:a", "copy"]);
-    } else {
-        c.args(["-c", "copy"]);
-    }
-    c.args(["-movflags", "+faststart"]).arg(job.output.as_ref().expect("join without video output"));
-    let out = c.output().map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("join failed").to_string())
     }
 }
 
-fn run_ffmpeg(cmd: &mut Command, dur: f64, idx: usize, tx: &Sender<Msg>, cancel: &AtomicBool) -> Result<(), String> {
+/// A path for an FFmpeg concat list. Relative paths there are resolved against the list's
+/// own folder, so it is made absolute first.
+fn concat_path(p: &Path) -> String {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().replace('\'', "'\\''")
+}
+
+/// Run one FFmpeg and report its progress as `span.0..span.1` of task `idx`.
+fn run_ffmpeg(cmd: &mut Command, dur: f64, idx: usize, tx: &Sender<Msg>, cancel: &AtomicBool, span: (f64, f64)) -> Result<(), String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
     let mut child = cmd.spawn().map_err(|e| format!("Could not start ffmpeg: {e}"))?;
     let mut stderr = child.stderr.take().unwrap();
@@ -844,7 +1097,8 @@ fn run_ffmpeg(cmd: &mut Command, dur: f64, idx: usize, tx: &Sender<Msg>, cancel:
         }
         if let Some(v) = line.strip_prefix("out_time_us=").or_else(|| line.strip_prefix("out_time_ms=")) {
             if let Ok(us) = v.trim().parse::<f64>() {
-                let _ = tx.send(Msg::Progress(idx, (us / 1e6 / dur.max(0.001)).clamp(0.0, 1.0)));
+                let f = (us / 1e6 / dur.max(0.001)).clamp(0.0, 1.0);
+                let _ = tx.send(Msg::Progress(idx, span.0 + f * (span.1 - span.0)));
             }
         }
     }
