@@ -1,6 +1,6 @@
 [package]
 name = "chop-chop-windows"
-version = "1.8.0"
+version = "1.8.1"
 edition = "2021"
 description = "Chop Chop Splitter for Windows: native Win32 common-controls front end (windows-rs) sharing the FFmpeg engine with the GTK build"
 license = "MIT"

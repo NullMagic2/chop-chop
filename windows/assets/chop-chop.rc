@@ -3,8 +3,8 @@
 1 RT_MANIFEST "chop-chop.manifest"
 
 1 VERSIONINFO
-FILEVERSION 1,8,0,0
-PRODUCTVERSION 1,8,0,0
+FILEVERSION 1,8,1,0
+PRODUCTVERSION 1,8,1,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -14,12 +14,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "NMagic"
       VALUE "FileDescription", "Chop Chop Splitter"
-      VALUE "FileVersion", "1.8.0"
+      VALUE "FileVersion", "1.8.1"
       VALUE "InternalName", "chop-chop"
       VALUE "LegalCopyright", "MIT License"
       VALUE "OriginalFilename", "chop-chop.exe"
       VALUE "ProductName", "Chop Chop Splitter"
-      VALUE "ProductVersion", "1.8.0"
+      VALUE "ProductVersion", "1.8.1"
     END
   END
   BLOCK "VarFileInfo"

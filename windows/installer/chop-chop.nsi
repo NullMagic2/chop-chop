@@ -1,7 +1,7 @@
 ; Chop Chop Splitter — Windows installer (NSIS 3, Modern UI 2).
 ;
 ; Build (from the repository root, after `cargo build --release` in windows/):
-;   makensis -DVERSION=1.8.0 -DAPPDIR=windows\target\release -DFFMPEG=path\to\ffmpeg\bin windows\installer\chop-chop.nsi
+;   makensis -DVERSION=1.8.1 -DAPPDIR=windows\target\release -DFFMPEG=path\to\ffmpeg\bin windows\installer\chop-chop.nsi
 ; APPDIR holds chop-chop.exe; FFMPEG holds ffmpeg.exe, ffprobe.exe and their DLLs.
 ;
 ; For a 64-bit setup.exe add "-XTarget amd64-unicode" (before the script name). That needs an
@@ -14,7 +14,7 @@ SetCompressor /SOLID lzma
 ManifestDPIAware true
 
 !ifndef VERSION
-  !define VERSION "1.8.0"
+  !define VERSION "1.8.1"
 !endif
 !ifndef APPDIR
   !define APPDIR "..\target\x86_64-pc-windows-gnu\release"
@@ -108,6 +108,8 @@ Section "!$(SecAppName)" SecApp
   SetOutPath "$INSTDIR"
   File "${APPDIR}\${EXE}"
   File "..\..\LICENSE"
+  ; Diagnostics: which GPU encoders work on this PC, and how fast they are.
+  File "..\tools\gpu-check.cmd"
   ; FFmpeg (GPL build) — the app finds it next to chop-chop.exe.
   File "${FFMPEG}\ffmpeg.exe"
   File "${FFMPEG}\ffprobe.exe"
@@ -166,6 +168,7 @@ Section "Uninstall"
   Delete "$INSTDIR\ffprobe.exe"
   Delete "$INSTDIR\*.dll"
   Delete "$INSTDIR\LICENSE"
+  Delete "$INSTDIR\gpu-check.cmd"
   RMDir /r "$INSTDIR\licenses"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
