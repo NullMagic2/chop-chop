@@ -15,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::i18n::{tr, trf};
 use crate::image::Image;
-use crate::splitter::{self, AudioFormat, CutJob, Msg, TaskKind, VideoInfo};
+use crate::splitter::{self, AudioFormat, CutJob, Msg, VideoInfo};
 
 pub const MIN_CLIP: f64 = 0.1;
 
@@ -106,6 +106,10 @@ pub struct App {
     pub font: HFONT,
     pub bold_font: HFONT,
     pub scale: f32,
+    /// Narrowest client width (DIPs) at which every control fits in the current language.
+    pub min_w: f32,
+    /// Background for labels and radio buttons on the tab page: its themed body color.
+    pub tab_bg: Option<(windows::Win32::Foundation::COLORREF, windows::Win32::Graphics::Gdi::HBRUSH)>,
 
     pub info: Option<VideoInfo>,
     pub mode: Mode,
@@ -133,8 +137,6 @@ pub struct App {
     pub card_img: Option<Image>,
     pub rx: Option<mpsc::Receiver<Msg>>,
     pub status: String,
-    /// " · NVIDIA NVENC" etc. while a video export runs.
-    pub encoder_note: String,
 }
 
 /// Thumbnails decoded on worker threads, handed over via `WM_APP_THUMB`.
@@ -669,6 +671,7 @@ impl App {
             has_audio: false,
             fps: 0.0,
             tmp_dir: PathBuf::new(),
+            src: info.clone(),
         };
         let files = splitter::outputs(&job_preview);
         if files.iter().any(|p| same_file(p, &info.path)) {
@@ -707,13 +710,9 @@ impl App {
         self.cancel = Some(cancel.clone());
         self.started = Some(Instant::now());
         self.set_overall(0.0, PBST_NORMAL);
-        let chunks = tasks.iter().filter(|t| matches!(t.kind, TaskKind::VideoChunk { .. })).count();
         let w = job.workers.min(n).to_string();
-        let mut status = match (&audio, mode) {
-            (None, Mode::Custom) => trf(
-                "Encoding {len} — split into {n} chunk(s) so every core helps…",
-                &[("len", splitter::fmt_ts(end_t - start_t)), ("n", chunks.to_string())],
-            ),
+        let status = match (&audio, mode) {
+            (None, Mode::Custom) => trf("Cutting {len}…", &[("len", splitter::fmt_ts(end_t - start_t))]),
             (None, Mode::Batch) => trf("Splitting into {n} parts, {w} at a time…", &[("n", n.to_string()), ("w", w)]),
             (Some((f, _)), Mode::Custom) => trf("Exporting {fmt} audio…", &[("fmt", f.label().to_string())]),
             (Some((f, _)), Mode::Batch) => trf(
@@ -721,9 +720,6 @@ impl App {
                 &[("n", n.to_string()), ("fmt", f.label().to_string()), ("w", w)],
             ),
         };
-        // Which encoder does the work (the GPU's, or libx264 on the CPU), shown while it runs.
-        self.encoder_note = if audio.is_none() { format!(" · {}", splitter::video_encoder().label()) } else { String::new() };
-        status.push_str(&self.encoder_note);
         self.set_status(&status);
         self.set_running_ui(true);
         let (tx, rx) = mpsc::channel::<Msg>();
@@ -817,8 +813,7 @@ impl App {
                 "{t} elapsed · about {left} left",
                 &[("t", splitter::fmt_time(elapsed)), ("left", splitter::fmt_time(eta))],
             );
-            let note = self.encoder_note.clone();
-            self.set_status(&format!("{eta_text}{note}"));
+            self.set_status(&eta_text);
         }
         None
     }
@@ -836,13 +831,8 @@ pub fn part_name(stem: &str, i: usize, n: usize, ext: &str) -> String {
     format!("{stem}_part{:0digits$}.{ext}", i + 1)
 }
 
-/// Translate the engine's job titles ("Parallel chunk 1/2", "Part 03 · MP3", "MP3 audio", …).
+/// Translate the engine's job titles ("Clip", "Part 03", "Part 03 · MP3", "MP3 audio", …).
 pub fn loc_title(t: &str) -> String {
-    if let Some(rest) = t.strip_prefix("Parallel chunk ") {
-        if let Some((i, n)) = rest.split_once('/') {
-            return trf("Parallel chunk {i}/{n}", &[("i", i.to_string()), ("n", n.to_string())]);
-        }
-    }
     if let Some(rest) = t.strip_prefix("Part ") {
         return match rest.split_once(" · ") {
             Some((i, fmt)) => trf("Part {i} · {fmt}", &[("i", i.to_string()), ("fmt", fmt.to_string())]),

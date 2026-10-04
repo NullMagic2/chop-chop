@@ -27,6 +27,7 @@ use windows::core::{w, BOOL, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Globalization::GetUserDefaultLocaleName;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemServices::{SS_ENDELLIPSIS, SS_LEFT, SS_NOPREFIX, SS_NOTIFY, SS_PATHELLIPSIS, SS_RIGHT};
@@ -123,6 +124,9 @@ fn lparam_xy(lp: LPARAM) -> (i32, i32) {
 
 fn main() {
     unsafe {
+        // No Windows error boxes for FFmpeg (child processes inherit this): if it can't start,
+        // for example while a virus scanner holds its freshly installed files, the app reports it.
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -176,6 +180,15 @@ fn main() {
             return;
         };
         create_app(hwnd);
+        // Start at the preferred size, but never larger than the screen it opens on (a 1080p
+        // laptop at 150 % scaling has room for about 1280 × 690), centred there.
+        let s = GetDpiForWindow(hwnd) as f32 / 96.0;
+        let wa = work_area(hwnd);
+        let (aw, ah) = (wa.right - wa.left, wa.bottom - wa.top);
+        let w = ((1240.0 * s) as i32).min(aw * 92 / 100);
+        let h = ((900.0 * s) as i32).min(ah * 92 / 100);
+        let _ = SetWindowPos(hwnd, None, wa.left + (aw - w) / 2, wa.top + (ah - h) / 2, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        fit_window(hwnd);
         let _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
         let _ = UpdateWindow(hwnd);
         STARTUP_FILE.with(|f| *f.borrow_mut() = std::env::args_os().nth(1).map(PathBuf::from));
@@ -361,7 +374,9 @@ fn create_app(hwnd: HWND) {
             }
         }
     }
-    u.go_btn = button(hwnd, ID_GO, BS_DEFPUSHBUTTON);
+    // A plain push button: a default button is always drawn highlighted. Enter still starts the
+    // job (IsDialogMessage sends IDOK, handled like ID_GO).
+    u.go_btn = button(hwnd, ID_GO, BS_PUSHBUTTON);
 
     // ── Progress ──
     u.bar = ctl(hwnd, PROGRESS_CLASSW, "", PBS_SMOOTH, NONE, 0);
@@ -418,6 +433,8 @@ fn create_app(hwnd: HWND) {
         font,
         bold_font,
         scale: dpi as f32 / 96.0,
+        min_w: 0.0,
+        tab_bg: None,
         info: None,
         mode: Mode::Custom,
         split_every: true,
@@ -444,7 +461,6 @@ fn create_app(hwnd: HWND) {
         card_img: None,
         rx: None,
         status: String::new(),
-        encoder_note: String::new(),
     };
     for (i, v) in [(E_MIN, 5.0), (E_SEC, 0.0), (E_PARTS, 4.0), (E_WORKERS, cores as f64)] {
         let (lo, hi) = app.spin_range(i);
@@ -466,6 +482,7 @@ fn create_app(hwnd: HWND) {
     enable(app.ui.audio_btn, false);
     app.set_out_dir(&videos_dir());
     set_flag(&app);
+    app.tab_bg = Some(tab_body(app.ui.tab));
     apply_texts(&mut app);
     APP.with(|a| *a.borrow_mut() = Some(app));
     with_app(|a| a.mode_changed());
@@ -520,11 +537,56 @@ fn apply_texts(a: &mut App) {
             SendMessageW(u.list, LVM_SETCOLUMNW, Some(WPARAM(i)), Some(LPARAM(&col as *const _ as isize)));
         }
     }
+    // The list caches its empty-list text (LVN_GETEMPTYMARKUP); make it ask for it again.
+    const LVM_RESETEMPTYTEXT: u32 = LVM_FIRST + 84; // commctrl.h; not in the windows crate
+    unsafe {
+        SendMessageW(u.list, LVM_RESETEMPTYTEXT, None, None);
+        let _ = InvalidateRect(Some(u.list), None, true);
+    }
     a.refresh_go();
     layout(a);
 }
 
 // ───────────────────────── layout ─────────────────────────
+
+/// Labels and radio buttons that sit on the tab page.
+fn on_tab_page(a: &App, ctl: HWND) -> bool {
+    let u = &a.ui;
+    [u.start_lbl, u.end_lbl, u.batch_head, u.every_radio, u.parts_radio, u.min_lbl, u.sec_lbl, u.parts_lbl].contains(&ctl)
+}
+
+/// The tab page's body color in the current theme (drawn once and sampled), and a brush of it.
+fn tab_body(tab: HWND) -> (COLORREF, HBRUSH) {
+    unsafe {
+        let mut color = COLORREF(GetSysColor(COLOR_BTNFACE));
+        let theme = OpenThemeData(Some(tab), w!("TAB"));
+        if !theme.is_invalid() {
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, 64, 64);
+            let old = SelectObject(dc, HGDIOBJ(bmp.0));
+            let rc = RECT { left: 0, top: 0, right: 64, bottom: 64 };
+            if DrawThemeBackground(theme, dc, TABP_PANE.0, 0, &rc, None).is_ok() {
+                color = GetPixel(dc, 32, 32);
+            }
+            SelectObject(dc, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(dc);
+            ReleaseDC(None, screen);
+            let _ = CloseThemeData(theme);
+        }
+        (color, CreateSolidBrush(color))
+    }
+}
+
+/// The usable area (without the taskbar) of the monitor the window is on, in pixels.
+fn work_area(hwnd: HWND) -> RECT {
+    unsafe {
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let _ = GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
+        mi.rcWork
+    }
+}
 
 fn text_width(a: &App, s: &str) -> i32 {
     unsafe {
@@ -572,7 +634,29 @@ pub fn layout(a: &mut App) {
     const PAD: f32 = 12.0; // group box inner padding
     const WIDE_PAD: f32 = 20.0; // inner side padding of the Video and Export groups
     let avail = cw - 2.0 * M;
-    let right_w = (avail * 0.4).clamp(420.0, 560.0);
+    let spin_w = 92.0;
+    // The Export column is wide enough for its longest texts in the current language: the
+    // field labels plus the cores note or the checkbox, and the two buttons side by side.
+    let lw = [u.workers_lbl, u.out_lbl, u.name_lbl].iter().map(|h| tw(&txt(*h))).fold(0.0, f32::max) + 12.0;
+    let aw = (tw(&txt(u.audio_btn)) + 36.0).max(130.0);
+    let dw = tw(&txt(u.dir_btn)) + 36.0;
+    let check_w = tw(&txt(u.open_check)) + 28.0; // box + gap + text
+    let fields = (spin_w + 12.0 + tw(&txt(u.cores_lbl)) + 4.0).max(check_w).max(260.0);
+    let export_need = 2.0 * WIDE_PAD + (lw + fields).max(aw + 12.0 + dw);
+    // The job list below: Job, Progress and Status as wide as their longest text in this
+    // language (header or values), and room for a whole time range.
+    let widest = |texts: &[String]| texts.iter().map(|t| tw(t)).fold(0.0, f32::max) + 18.0;
+    let job_w = widest(&[tr("Job"), tr("Clip"), loc_title("Part 10 · OPUS"), loc_title("OPUS audio")]);
+    let prog_w = widest(&[tr("Progress"), "100%".into()]);
+    let stat_w = widest(&["Status", "Queued", "Working", "Done", "Failed", "Stopped"].map(tr));
+    let range_min = tw("00:00:00.000 → 00:00:00.000") + 18.0;
+    let scroll_w = unsafe { GetSystemMetrics(SM_CXVSCROLL) } as f32 / s;
+    let list_need = 2.0 * PAD + 4.0 + scroll_w + job_w + prog_w + stat_w + range_min;
+    // The left column keeps room for the video's info line (duration · size · codecs · file size).
+    let left_need = (2.0 * WIDE_PAD + 142.0 + 16.0 + tw(&txt(u.drop_info)) + 4.0).max(470.0);
+    let right_need = export_need.max(list_need).max(420.0);
+    let min_w = 2.0 * M + left_need + G + right_need;
+    let right_w = (avail * 0.4).clamp(420.0, 560.0).min(avail - G - left_need).max(right_need);
     let left_w = avail - G - right_w;
     let (lx, rx) = (M, M + left_w + G);
 
@@ -643,7 +727,6 @@ pub fn layout(a: &mut App) {
     place(u.every_radio, px, r1, rw, EH, s);
     place(u.parts_radio, px, r2, rw, EH, s);
     let sx = px + rw + 10.0;
-    let spin_w = 92.0;
     place(u.edits[E_MIN], sx, r1, spin_w, EH, s);
     let mw = tw(&txt(u.min_lbl)) + 4.0;
     place(u.min_lbl, sx + spin_w + 8.0, r1 + LO, mw, LH, s);
@@ -655,15 +738,11 @@ pub fn layout(a: &mut App) {
     for h in [u.batch_head, u.every_radio, u.parts_radio, u.min_lbl, u.sec_lbl, u.parts_lbl, u.edits[E_MIN], u.edits[E_SEC], u.edits[E_PARTS]] {
         show(h, !custom);
     }
-    for i in [E_MIN, E_SEC, E_PARTS] {
-        show(u.spins[i], !custom);
-    }
 
     // ── Export ──
     let ey = top;
     let gx = rx + WIDE_PAD;
     let gw = right_w - 2.0 * WIDE_PAD;
-    let lw = [u.workers_lbl, u.out_lbl, u.name_lbl].iter().map(|h| tw(&txt(*h))).fold(0.0, f32::max) + 12.0;
     let fx = gx + lw;
     let fw = gw - lw;
     let mut y = ey + CAP;
@@ -681,12 +760,21 @@ pub fn layout(a: &mut App) {
     place(u.edits[E_NAME], fx, y, fw - xw - 6.0, EH, s);
     place(u.ext_lbl, fx + fw - xw, y + LO, xw, LH, s);
     y += EH + 12.0;
-    place(u.open_check, fx, y, fw, 26.0, s);
+    // Under the fields when it fits there, else across the whole group.
+    if check_w <= fw {
+        place(u.open_check, fx, y, fw, 26.0, s);
+    } else {
+        place(u.open_check, gx, y, gw, 26.0, s);
+    }
     y += 26.0 + 14.0;
-    let aw = (tw(&txt(u.audio_btn)) + 36.0).max(130.0);
-    place(u.audio_btn, fx, y, aw, BH, s);
-    let dw = tw(&txt(u.dir_btn)) + 36.0;
-    place(u.dir_btn, gx + gw - dw, y, dw, BH, s);
+    // Side by side from the group's left edge; one under the other if the window is too narrow.
+    place(u.audio_btn, gx, y, aw, BH, s);
+    if aw + 12.0 + dw <= gw {
+        place(u.dir_btn, gx + gw - dw, y, dw, BH, s);
+    } else {
+        y += BH + 8.0;
+        place(u.dir_btn, gx, y, dw, BH, s);
+    }
     y += BH + 16.0;
     place(u.export_grp, rx, ey, right_w, y - ey, s);
     // Up-down buddies follow their edits.
@@ -694,6 +782,10 @@ pub fn layout(a: &mut App) {
         unsafe {
             SendMessageW(u.spins[i], UDM_SETBUDDY, Some(WPARAM(u.edits[i].0 as usize)), None);
         }
+    }
+    // After UDM_SETBUDDY, which can show a hidden spinner again.
+    for i in [E_MIN, E_SEC, E_PARTS] {
+        show(u.spins[i], !custom);
     }
     show(u.spins[E_WORKERS], true);
 
@@ -716,14 +808,37 @@ pub fn layout(a: &mut App) {
     place(u.status, qx, st_y, qw, st_h, s);
     let ly = pgy + CAP + 2.0 + 18.0 + 12.0;
     place(u.list, qx, ly, qw, (st_y - 8.0 - ly).max(40.0), s);
-    let lwp = ((qw - 4.0) * s) as i32 - unsafe { GetSystemMetrics(SM_CXVSCROLL) };
-    for (c, frac) in [(0, 0.17), (1, 0.48), (2, 0.17), (3, 0.18)] {
+    // Range takes what the other columns leave; all shrink evenly only below the minimum size.
+    let total = qw - 4.0 - scroll_w;
+    let k = (total / (job_w + prog_w + stat_w + range_min)).min(1.0);
+    let range_w = total - k * (job_w + prog_w + stat_w);
+    for (c, w) in [(0, k * job_w), (1, range_w), (2, k * prog_w), (3, k * stat_w)] {
         unsafe {
-            SendMessageW(u.list, LVM_SETCOLUMNWIDTH, Some(WPARAM(c)), Some(LPARAM((lwp as f32 * frac) as isize)));
+            SendMessageW(u.list, LVM_SETCOLUMNWIDTH, Some(WPARAM(c)), Some(LPARAM((w * s) as isize)));
         }
     }
     unsafe {
         let _ = InvalidateRect(Some(a.ui.hwnd), None, true);
+    }
+    a.min_w = min_w;
+}
+
+/// Widen the window if the current language needs more room than it has (never past the screen).
+fn fit_window(hwnd: HWND) {
+    let Some((min_w, s)) = with_app(|a| (a.min_w, a.scale)) else { return };
+    unsafe {
+        let mut rc = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rc);
+        let need = (min_w * s).ceil() as i32 - rc.right;
+        if need <= 0 {
+            return;
+        }
+        let mut wr = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut wr);
+        let wa = work_area(hwnd);
+        let w = (wr.right - wr.left + need).min(wa.right - wa.left);
+        let x = wr.left.min(wa.right - w).max(wa.left);
+        let _ = SetWindowPos(hwnd, None, x, wr.top, w, wr.bottom - wr.top, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 
@@ -796,8 +911,11 @@ fn show_error(title: &str, body: &str) {
 }
 
 fn load_file(path: PathBuf) {
-    if let Some(Err((t, b))) = with_app(|a| a.load_file(&path)) {
-        show_error(&t, &b);
+    match with_app(|a| (a.load_file(&path), a.ui.hwnd)) {
+        Some((Err((t, b)), _)) => show_error(&t, &b),
+        // The video's info line may need a wider window.
+        Some((Ok(()), hwnd)) => fit_window(hwnd),
+        None => {}
     }
 }
 
@@ -915,13 +1033,18 @@ fn set_language(l: Lang) {
         return;
     }
     i18n::set_lang(l);
-    with_app(|a| {
+    let hwnd = with_app(|a| {
         set_flag(a);
         apply_texts(a);
         if a.info.is_some() {
             a.request_preview(0); // translated badge
         }
+        a.ui.hwnd
     });
+    // Outside the borrow: resizing lays the window out again.
+    if let Some(h) = hwnd {
+        fit_window(h);
+    }
 }
 
 /// The flag button's popup: the four languages, the current one checked.
@@ -1062,6 +1185,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 }
                 return LRESULT(0);
             }
+            WM_CTLCOLORSTATIC if with_app(|a| on_tab_page(a, HWND(lp.0 as _))).unwrap_or(false) => {
+                // Labels and radio buttons on the tab page take its body color, not white.
+                let hdc = HDC(wp.0 as _);
+                let Some((color, brush)) = with_app(|a| *a.tab_bg.get_or_insert_with(|| tab_body(a.ui.tab))) else {
+                    return LRESULT(0);
+                };
+                SetBkColor(hdc, color);
+                SetTextColor(hdc, COLORREF(GetSysColor(COLOR_WINDOWTEXT)));
+                return LRESULT(brush.0 as isize);
+            }
+            WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
+                with_app(|a| {
+                    if let Some((_, brush)) = a.tab_bg.replace(tab_body(a.ui.tab)) {
+                        let _ = DeleteObject(HGDIOBJ(brush.0));
+                    }
+                    let _ = InvalidateRect(Some(a.ui.hwnd), None, true);
+                });
+            }
             WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
                 let hdc = HDC(wp.0 as _);
                 let ctl = HWND(lp.0 as _);
@@ -1084,8 +1225,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             }
             WM_GETMINMAXINFO => {
                 let mmi = &mut *(lp.0 as *mut MINMAXINFO);
+                // The layout fits from about 940 × 560; the window may always shrink to the screen.
                 let s = GetDpiForWindow(hwnd) as f32 / 96.0;
-                mmi.ptMinTrackSize = POINT { x: (1080.0 * s) as i32, y: (800.0 * s) as i32 };
+                let wa = work_area(hwnd);
+                let content = with_app(|a| a.min_w * s + 16.0 * s).unwrap_or(0.0);
+                mmi.ptMinTrackSize = POINT {
+                    x: ((960.0 * s).max(content) as i32).min(wa.right - wa.left),
+                    y: ((620.0 * s) as i32).min(wa.bottom - wa.top),
+                };
                 return LRESULT(0);
             }
             WM_DPICHANGED => {
@@ -1297,7 +1444,8 @@ fn handle_at(hwnd: HWND, a: &App, x: i32) -> Handle {
 
 fn paint_timeline(hwnd: HWND, dc: HDC, rc: RECT, a: &App) {
     unsafe {
-        let _ = FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
+        // It sits on the tab page, so it shares the page's color.
+        let _ = FillRect(dc, &rc, a.tab_bg.map(|t| t.1).unwrap_or_else(|| GetSysColorBrush(COLOR_BTNFACE)));
         let g = track_geom(hwnd, a);
         let enabled = a.info.is_some() && !a.running;
         let theme = OpenThemeData(Some(hwnd), w!("TRACKBAR"));
