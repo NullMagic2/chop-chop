@@ -38,10 +38,11 @@ Installed-Size: ${SIZE}
 Depends: libgtk-3-0t64 (>= 3.24) | libgtk-3-0 (>= 3.24), libglib2.0-0t64 | libglib2.0-0, libc6 (>= 2.39), ffmpeg
 Maintainer: Carlos <mega.watt2@gmail.com>
 Homepage: https://github.com/NullMagic2/chop-chop
-Description: Chop Chop Splitter - cut and split videos fast (GTK 3, multicore)
+Description: Chop Chop Splitter - cut and split videos fast (GTK 3)
  Cut a clip from a start time to an end time, or batch-split a whole
- video into parts, with a live thumbnail preview. Chunks are encoded in parallel across all CPU cores
- with FFmpeg for frame-accurate cuts. The segment can also be exported
+ video into parts, with a live thumbnail preview. Cuts are frame-accurate
+ and almost lossless: FFmpeg re-encodes only the frames next to each cut
+ and copies the rest. The segment can also be exported
  as WAV, MP3, OGG, FLAC, M4A or OPUS audio files.
  Uses Ubuntu's Yaru icon theme.
 CTRL
